@@ -171,6 +171,24 @@ fn main() {
                         }
                     };
 
+                    // Log raw bytes received for debugging
+                    log::debug!("Received {} bytes:{}", msg.len(), smb2::hex_dump(&msg, 128));
+
+                    // Check for SMB1 negotiate (macOS sends \xFF SMB first)
+                    if smb2::is_smb1_negotiate(&msg) {
+                        log::info!("Received SMB1 negotiate — responding with SMB2 upgrade");
+                        let response = smb2::build_smb1_to_smb2_negotiate_response();
+                        if let Err(e) = stream.write_all(&response) {
+                            log::debug!("Write error: {e}");
+                            break;
+                        }
+                        if let Err(e) = stream.flush() {
+                            log::debug!("Flush error: {e}");
+                            break;
+                        }
+                        continue; // Next message should be a proper SMB2 negotiate
+                    }
+
                     let response = session.handle_message(&msg);
                     if !response.is_empty() {
                         if let Err(e) = stream.write_all(&response) {

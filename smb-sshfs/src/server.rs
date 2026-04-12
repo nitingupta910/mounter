@@ -236,9 +236,21 @@ impl SmbSession {
     fn handle_negotiate(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
         // Pick SMB 2.1 (simple, no signing required)
         let mut resp = Vec::with_capacity(128);
+        // Parse client's requested dialects to pick the best one
+        let dialect_count = if body.len() >= 4 {
+            read_u16_le(body, 2) as usize
+        } else {
+            0
+        };
+        // Force SMB 2.0.2 — simplest dialect, no signing needed for guest.
+        // SMB 3.x requires signing which breaks unsigned guest sessions.
+        let _ = dialect_count;
+        let best_dialect = SMB2_DIALECT_202;
+        log::info!("Negotiated dialect: 0x{:04x}", best_dialect);
+
         resp.extend_from_slice(&65u16.to_le_bytes()); // StructureSize
-        resp.extend_from_slice(&0u16.to_le_bytes()); // SecurityMode (no signing)
-        resp.extend_from_slice(&SMB2_DIALECT_210.to_le_bytes()); // DialectRevision
+        resp.extend_from_slice(&0u16.to_le_bytes()); // SecurityMode (no signing — guest only)
+        resp.extend_from_slice(&best_dialect.to_le_bytes()); // DialectRevision
         resp.extend_from_slice(&0u16.to_le_bytes()); // Reserved
 
         // ServerGuid (16 bytes)
@@ -260,7 +272,9 @@ impl SmbSession {
 
         // SecurityBuffer — SPNEGO with NTLMSSP OID
         let spnego_init = build_spnego_init();
-        let sec_offset = (SMB2_HEADER_SIZE + resp.len() + 4) as u16; // +4 for remaining fields
+        // SecurityBuffer offset from start of SMB2 header:
+        // header (64) + body fields through Reserved2 (64) = 128
+        let sec_offset = (SMB2_HEADER_SIZE + resp.len() + 8) as u16; // +2 offset +2 length +4 reserved2
         resp.extend_from_slice(&sec_offset.to_le_bytes()); // SecurityBufferOffset
         resp.extend_from_slice(&(spnego_init.len() as u16).to_le_bytes()); // SecurityBufferLength
         resp.extend_from_slice(&0u32.to_le_bytes()); // Reserved2
@@ -273,39 +287,52 @@ impl SmbSession {
 
     fn handle_session_setup(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
         self.auth_phase += 1;
+        log::info!("SESSION_SETUP phase {}", self.auth_phase);
 
-        if self.auth_phase == 1 {
-            // Send NTLMSSP challenge
-            let challenge = ntlmssp_challenge();
-            let spnego = wrap_ntlmssp_in_spnego(&challenge);
-
-            let mut resp = Vec::with_capacity(16 + spnego.len());
-            resp.extend_from_slice(&9u16.to_le_bytes()); // StructureSize
-            resp.extend_from_slice(&0u16.to_le_bytes()); // SessionFlags (guest=0x01, but try 0 first)
-            let sec_offset = (SMB2_HEADER_SIZE + 8) as u16;
-            resp.extend_from_slice(&sec_offset.to_le_bytes()); // SecurityBufferOffset
-            resp.extend_from_slice(&(spnego.len() as u16).to_le_bytes()); // SecurityBufferLength
-            resp.extend_from_slice(&spnego);
-
-            // Override session_id in response header
-            let mut full_hdr = hdr.clone();
-            full_hdr.session_id = self.session_id;
-            full_hdr.write_response(STATUS_MORE_PROCESSING, &resp, out);
+        // Extract client's security buffer (SPNEGO wrapping NTLMSSP)
+        // MS-SMB2 2.2.5: SecurityBufferOffset at body[12], Length at body[14]
+        let sec_offset = if body.len() >= 14 {
+            read_u16_le(body, 12) as usize
         } else {
-            // Accept authentication (guest mode — accept anything)
-            let spnego = spnego_accept_complete();
+            0
+        };
+        let sec_length = if body.len() >= 16 {
+            read_u16_le(body, 14) as usize
+        } else {
+            0
+        };
+        let sec_start = sec_offset.saturating_sub(SMB2_HEADER_SIZE);
+        let sec_data = if sec_start + sec_length <= body.len() {
+            &body[sec_start..sec_start + sec_length]
+        } else {
+            &[]
+        };
 
-            let mut resp = Vec::with_capacity(16 + spnego.len());
-            resp.extend_from_slice(&9u16.to_le_bytes()); // StructureSize
-            resp.extend_from_slice(&1u16.to_le_bytes()); // SessionFlags: IS_GUEST
-            let sec_offset = (SMB2_HEADER_SIZE + 8) as u16;
-            resp.extend_from_slice(&sec_offset.to_le_bytes()); // SecurityBufferOffset
-            resp.extend_from_slice(&(spnego.len() as u16).to_le_bytes()); // SecurityBufferLength
-            resp.extend_from_slice(&spnego);
+        // Detect NTLMSSP message type inside SPNEGO wrapper
+        let ntlmssp_type = sec_data
+            .windows(12)
+            .find(|w| w.starts_with(b"NTLMSSP\0"))
+            .map(|w| u32::from_le_bytes([w[8], w[9], w[10], w[11]]));
 
-            hdr.write_response(STATUS_SUCCESS, &resp, out);
-            log::info!("Session authenticated (guest)");
-        }
+        log::info!(
+            "SESSION_SETUP: sec_offset={sec_offset} sec_length={sec_length} ntlmssp_type={:?}",
+            ntlmssp_type
+        );
+
+        // Accept immediately as guest — skip NTLMSSP challenge/response.
+        // This works for localhost-only servers with public shares.
+        let mut resp = Vec::with_capacity(16);
+        resp.extend_from_slice(&9u16.to_le_bytes()); // StructureSize
+        resp.extend_from_slice(&1u16.to_le_bytes()); // SessionFlags: IS_GUEST
+        let sec_off = (SMB2_HEADER_SIZE + 8) as u16;
+        resp.extend_from_slice(&sec_off.to_le_bytes()); // SecurityBufferOffset
+        resp.extend_from_slice(&0u16.to_le_bytes()); // SecurityBufferLength: 0
+
+        let mut full_hdr = hdr.clone();
+        full_hdr.session_id = self.session_id;
+        full_hdr.write_response(STATUS_SUCCESS, &resp, out);
+        log::info!("Session accepted as guest");
+        self.auth_phase = 0;
     }
 
     // ── LOGOFF ──────────────────────────────────────────────────────

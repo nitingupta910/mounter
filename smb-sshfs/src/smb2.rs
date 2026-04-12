@@ -9,6 +9,7 @@ use std::io::{self, Read, Write};
 // ── Protocol constants ──────────────────────────────────────────────
 
 pub const SMB2_MAGIC: &[u8; 4] = b"\xfeSMB";
+pub const SMB1_MAGIC: &[u8; 4] = b"\xffSMB";
 pub const SMB2_HEADER_SIZE: usize = 64;
 
 // Commands
@@ -165,28 +166,14 @@ impl Smb2Header {
     pub fn write_response(&self, status: u32, body: &[u8], out: &mut Vec<u8>) {
         let total = SMB2_HEADER_SIZE + body.len();
 
-        // NetBIOS session header (4 bytes: length)
+        // NetBIOS session header (4 bytes: length as big-endian u32)
         out.extend_from_slice(&(total as u32).to_be_bytes());
 
-        // SMB2 header (64 bytes)
-        out.extend_from_slice(SMB2_MAGIC); // 0-3: ProtocolId
-        out.extend_from_slice(&64u16.to_le_bytes()); // 4-5: StructureSize
-        out.extend_from_slice(&self.credit_charge.to_le_bytes()); // 6-7: CreditCharge
-        out.extend_from_slice(&status.to_le_bytes()); // 8-11: Status (was 16-19, but channel seq at 8)
-                                                      // Actually, the header layout:
-                                                      // 0-3: ProtocolId
-                                                      // 4-5: StructureSize (64)
-                                                      // 6-7: CreditCharge
-                                                      // 8-9: Status (low 16) or ChannelSequence  -- for response, it's Status
-                                                      // 8-11: Status (full 32 bits)
-                                                      // Wait, let me get this right per MS-SMB2 spec:
-
-        // Clear and rebuild properly
-        out.truncate(out.len() - 8); // remove what we just wrote after NetBIOS
-        out.extend_from_slice(SMB2_MAGIC); // 0-3
-        out.extend_from_slice(&64u16.to_le_bytes()); // 4-5: StructureSize
-        out.extend_from_slice(&1u16.to_le_bytes()); // 6-7: CreditCharge
-        out.extend_from_slice(&status.to_le_bytes()); // 8-11: Status
+        // SMB2 header (64 bytes) — MS-SMB2 2.2.1
+        out.extend_from_slice(SMB2_MAGIC); // 0-3:   ProtocolId
+        out.extend_from_slice(&64u16.to_le_bytes()); // 4-5:   StructureSize
+        out.extend_from_slice(&1u16.to_le_bytes()); // 6-7:   CreditCharge
+        out.extend_from_slice(&status.to_le_bytes()); // 8-11:  Status
         out.extend_from_slice(&self.command.to_le_bytes()); // 12-13: Command
         let credits_granted = self.credits_requested.max(1);
         out.extend_from_slice(&credits_granted.to_le_bytes()); // 14-15: CreditResponse
@@ -194,7 +181,7 @@ impl Smb2Header {
         out.extend_from_slice(&flags.to_le_bytes()); // 16-19: Flags
         out.extend_from_slice(&0u32.to_le_bytes()); // 20-23: NextCommand
         out.extend_from_slice(&self.message_id.to_le_bytes()); // 24-31: MessageId
-        out.extend_from_slice(&0u32.to_le_bytes()); // 32-35: Reserved (async: AsyncId low)
+        out.extend_from_slice(&0u32.to_le_bytes()); // 32-35: Reserved
         out.extend_from_slice(&self.tree_id.to_le_bytes()); // 36-39: TreeId
         out.extend_from_slice(&self.session_id.to_le_bytes()); // 40-47: SessionId
         out.extend_from_slice(&[0u8; 16]); // 48-63: Signature
@@ -226,7 +213,72 @@ pub fn read_u64_le(buf: &[u8], off: usize) -> u64 {
     ])
 }
 
-/// Read an SMB2 message from a TCP stream (NetBIOS framing).
+/// Check if the given message bytes are an SMB1 negotiate request (magic \xFF SMB).
+pub fn is_smb1_negotiate(msg: &[u8]) -> bool {
+    msg.len() >= 4 && &msg[0..4] == SMB1_MAGIC
+}
+
+/// Build an SMB2 NEGOTIATE response to an SMB1 negotiate request.
+/// This tells the client to upgrade from SMB1 to SMB2.
+/// Per MS-SMB2 3.3.5.3.1: the server responds with an SMB2 NEGOTIATE
+/// response with DialectRevision = 0x02FF (wildcard) to indicate that
+/// the client should re-negotiate using SMB2.
+pub fn build_smb1_to_smb2_negotiate_response() -> Vec<u8> {
+    // We build a full SMB2 NEGOTIATE response with dialect 0x02FF.
+    // This is the standard "multi-protocol negotiate" response that
+    // tells macOS to switch from SMB1 to SMB2.
+
+    let mut body = Vec::with_capacity(128);
+    body.extend_from_slice(&65u16.to_le_bytes()); // StructureSize
+    body.extend_from_slice(&0u16.to_le_bytes()); // SecurityMode (no signing)
+    body.extend_from_slice(&0x02FFu16.to_le_bytes()); // DialectRevision: SMB2 wildcard
+    body.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+
+    // ServerGuid (16 bytes)
+    body.extend_from_slice(&[
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
+    ]);
+    body.extend_from_slice(&0u32.to_le_bytes()); // Capabilities
+    body.extend_from_slice(&(256 * 1024u32).to_le_bytes()); // MaxTransactSize
+    body.extend_from_slice(&(256 * 1024u32).to_le_bytes()); // MaxReadSize
+    body.extend_from_slice(&(256 * 1024u32).to_le_bytes()); // MaxWriteSize
+    body.extend_from_slice(&0u64.to_le_bytes()); // SystemTime
+    body.extend_from_slice(&0u64.to_le_bytes()); // ServerStartTime
+
+    // SecurityBuffer — offset and length (no security blob for this phase)
+    let sec_offset = (SMB2_HEADER_SIZE + body.len() + 4) as u16; // +4 for remaining fields
+    body.extend_from_slice(&sec_offset.to_le_bytes()); // SecurityBufferOffset
+    body.extend_from_slice(&0u16.to_le_bytes()); // SecurityBufferLength
+    body.extend_from_slice(&0u32.to_le_bytes()); // Reserved2
+
+    let total = SMB2_HEADER_SIZE + body.len();
+    let mut out = Vec::with_capacity(4 + total);
+
+    // NetBIOS session header
+    out.extend_from_slice(&(total as u32).to_be_bytes());
+
+    // SMB2 header for the negotiate response
+    out.extend_from_slice(SMB2_MAGIC); // 0-3:   ProtocolId
+    out.extend_from_slice(&64u16.to_le_bytes()); // 4-5:   StructureSize
+    out.extend_from_slice(&0u16.to_le_bytes()); // 6-7:   CreditCharge
+    out.extend_from_slice(&0u32.to_le_bytes()); // 8-11:  Status: SUCCESS
+    out.extend_from_slice(&SMB2_NEGOTIATE.to_le_bytes()); // 12-13: Command: NEGOTIATE
+    out.extend_from_slice(&1u16.to_le_bytes()); // 14-15: CreditResponse
+    let flags = SMB2_FLAGS_SERVER_TO_REDIR;
+    out.extend_from_slice(&flags.to_le_bytes()); // 16-19: Flags
+    out.extend_from_slice(&0u32.to_le_bytes()); // 20-23: NextCommand
+    out.extend_from_slice(&0u64.to_le_bytes()); // 24-31: MessageId
+    out.extend_from_slice(&0u32.to_le_bytes()); // 32-35: Reserved
+    out.extend_from_slice(&0u32.to_le_bytes()); // 36-39: TreeId
+    out.extend_from_slice(&0u64.to_le_bytes()); // 40-47: SessionId
+    out.extend_from_slice(&[0u8; 16]); // 48-63: Signature
+
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Read an SMB message from a TCP stream (NetBIOS framing).
 /// Returns the raw message bytes (without the 4-byte length prefix).
 pub fn read_message(stream: &mut dyn Read) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
@@ -241,6 +293,43 @@ pub fn read_message(stream: &mut dyn Read) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+/// Format a hex dump of the first `max_bytes` bytes of data (for debug logging).
+pub fn hex_dump(data: &[u8], max_bytes: usize) -> String {
+    use std::fmt::Write;
+    let limit = data.len().min(max_bytes);
+    let mut s = String::new();
+    for (i, chunk) in data[..limit].chunks(16).enumerate() {
+        let _ = write!(s, "\n  {:04x}: ", i * 16);
+        for (j, byte) in chunk.iter().enumerate() {
+            let _ = write!(s, "{:02x} ", byte);
+            if j == 7 {
+                s.push(' ');
+            }
+        }
+        // Pad to align ASCII column
+        let pad = 16 - chunk.len();
+        for _ in 0..pad {
+            s.push_str("   ");
+        }
+        if pad > 8 {
+            s.push(' ');
+        }
+        s.push_str(" |");
+        for byte in chunk {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                s.push(*byte as char);
+            } else {
+                s.push('.');
+            }
+        }
+        s.push('|');
+    }
+    if data.len() > limit {
+        let _ = write!(s, "\n  ... ({} more bytes)", data.len() - limit);
+    }
+    s
 }
 
 /// Encode a UTF-16LE string (for SMB wire format).
