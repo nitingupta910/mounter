@@ -754,10 +754,15 @@ directory mask = 0755
     fs::create_dir_all(&macmount).ok();
     let mac_path = macmount.to_string_lossy().to_string();
 
-    // Unmount if already mounted
+    // Force-unmount if already mounted (handles stale SMB mounts)
     let (_, mounts) = shell(&["mount"]);
     if mounts.contains(&format!(" on {mac_path} ")) {
-        shell(&["/sbin/umount", &mac_path]);
+        let (ok, _) = shell(&["/sbin/umount", &mac_path]);
+        if !ok {
+            shell(&["/usr/sbin/diskutil", "unmount", "force", &mac_path]);
+        }
+        // Brief wait for unmount to complete
+        thread::sleep(Duration::from_millis(500));
     }
 
     let cip = docker_container_ip();
@@ -767,7 +772,17 @@ directory mask = 0755
     let smb_url = format!("//guest@{cip}/{name}");
     let (ok, out) = shell(&["/sbin/mount_smbfs", &smb_url, &mac_path]);
     if !ok {
-        die(&format!("SMB mount failed: {out}"));
+        // "File exists" means mount point is still occupied — retry after force unmount
+        if out.contains("File exists") {
+            shell(&["/usr/sbin/diskutil", "unmount", "force", &mac_path]);
+            thread::sleep(Duration::from_millis(500));
+            let (ok2, out2) = shell(&["/sbin/mount_smbfs", &smb_url, &mac_path]);
+            if !ok2 {
+                die(&format!("SMB mount failed after retry: {out2}"));
+            }
+        } else {
+            die(&format!("SMB mount failed: {out}"));
+        }
     }
 
     info(&format!("Mounted at {mac_path}"));
