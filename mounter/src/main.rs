@@ -599,13 +599,14 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
 
 fn cmd_mount(args: &[String]) {
     if args.is_empty() {
-        die("Usage: mounter mount [user@]host:[/path] [-p port] [-i identity] [-n name]");
+        die("Usage: mounter mount [user@]host:[/path] [mountpoint] [-p port] [-i identity] [-n name]");
     }
 
     let remote = &args[0];
     let mut port_override: Option<String> = None;
     let mut identity_override: Option<String> = None;
     let mut name_override: Option<String> = None;
+    let mut mountpoint_override: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -621,6 +622,14 @@ fn cmd_mount(args: &[String]) {
             "-n" | "--name" => {
                 i += 1;
                 name_override = Some(args.get(i).cloned().unwrap_or_default());
+            }
+            "-m" | "--mountpoint" => {
+                i += 1;
+                mountpoint_override = Some(args.get(i).cloned().unwrap_or_default());
+            }
+            s if !s.starts_with('-') && mountpoint_override.is_none() => {
+                // Positional arg after remote = mountpoint
+                mountpoint_override = Some(s.to_string());
             }
             other => die(&format!("Unknown option: {other}")),
         }
@@ -730,7 +739,18 @@ directory mask = 0755
     docker_exec("kill -HUP $(pidof smbd) 2>/dev/null || smbd --daemon --no-process-group");
 
     // 5. Mount SMB on macOS
-    let macmount = mount_base().join(&name);
+    let macmount = match &mountpoint_override {
+        Some(p) => {
+            let expanded = if p.starts_with('~') {
+                let home = env::var("HOME").unwrap_or_default();
+                PathBuf::from(p.replacen('~', &home, 1))
+            } else {
+                PathBuf::from(p)
+            };
+            expanded
+        }
+        None => mount_base().join(&name),
+    };
     fs::create_dir_all(&macmount).ok();
     let mac_path = macmount.to_string_lossy().to_string();
 
@@ -907,7 +927,7 @@ fn usage() -> ! {
     eprintln!("mounter — mount remote SSH directories in Finder");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  mounter mount [user@]host:[/path] [-n name] [-p port] [-i identity]");
+    eprintln!("  mounter mount [user@]host:[/path] [mountpoint] [-n name] [-p port] [-i identity]");
     eprintln!("  mounter unmount <name>");
     eprintln!("  mounter list");
     eprintln!("  mounter status");
