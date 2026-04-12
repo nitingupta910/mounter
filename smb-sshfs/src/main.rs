@@ -189,17 +189,57 @@ fn main() {
                         continue; // Next message should be a proper SMB2 negotiate
                     }
 
-                    let response = session.handle_message(&msg);
-                    if !response.is_empty() {
-                        if let Err(e) = stream.write_all(&response) {
-                            log::debug!("Write error: {e}");
-                            break;
-                        }
-                        if let Err(e) = stream.flush() {
-                            log::debug!("Flush error: {e}");
-                            break;
-                        }
+                    // Handle compounded requests — macOS sends multiple
+                    // SMB2 commands in one TCP message (NextCommand field).
+                    // Compound responses must be in a SINGLE NetBIOS frame.
+                    let mut cmd_offsets = Vec::new();
+                    let mut offset = 0;
+                    while offset < msg.len() {
+                        if msg.len() - offset < smb2::SMB2_HEADER_SIZE { break; }
+                        let next_cmd = smb2::read_u32_le(&msg[offset..], 20) as usize;
+                        let cmd_end = if next_cmd > 0 { offset + next_cmd } else { msg.len() };
+                        cmd_offsets.push((offset, cmd_end));
+                        if next_cmd == 0 { break; }
+                        offset += next_cmd;
                     }
+
+                    if cmd_offsets.len() <= 1 {
+                        // Single command — simple path
+                        let response = session.handle_message(&msg);
+                        if !response.is_empty() {
+                            if let Err(e) = stream.write_all(&response) { log::debug!("Write: {e}"); break; }
+                        }
+                    } else {
+                        // Compound — collect response bodies (strip NetBIOS headers),
+                        // set NextCommand, wrap in single NetBIOS frame.
+                        let mut resp_bodies: Vec<Vec<u8>> = Vec::new();
+                        for (i, (start, end)) in cmd_offsets.iter().enumerate() {
+                            let single = &msg[*start..*end];
+                            let cmd_code = smb2::read_u16_le(single, 12);
+                            log::info!("  Compound[{i}]: cmd=0x{cmd_code:04x} len={}", single.len());
+                            let resp = session.handle_message(single);
+                            // Strip 4-byte NetBIOS header
+                            if resp.len() > 4 { resp_bodies.push(resp[4..].to_vec()); }
+                        }
+
+                        // Set NextCommand offsets and combine
+                        let count = resp_bodies.len();
+                        let mut combined = Vec::new();
+                        for i in 0..count {
+                            if i < count - 1 {
+                                while resp_bodies[i].len() % 8 != 0 { resp_bodies[i].push(0); }
+                                let next = resp_bodies[i].len() as u32;
+                                resp_bodies[i][20..24].copy_from_slice(&next.to_le_bytes());
+                            }
+                            combined.extend_from_slice(&resp_bodies[i]);
+                        }
+
+                        // Single NetBIOS frame for all responses
+                        let frame_len = (combined.len() as u32).to_be_bytes();
+                        if let Err(e) = stream.write_all(&frame_len) { log::debug!("Write: {e}"); break; }
+                        if let Err(e) = stream.write_all(&combined) { log::debug!("Write: {e}"); break; }
+                    }
+                    if let Err(e) = stream.flush() { log::debug!("Flush: {e}"); break; }
                 }
                 log::info!("Client disconnected");
             }

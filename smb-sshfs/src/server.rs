@@ -124,7 +124,10 @@ pub struct SmbSession {
     handles: HashMap<u64, OpenHandle>,
     next_handle: u64,
     cache: AttrCache,
-    auth_phase: u8, // 0=not started, 1=challenge sent, 2=authenticated
+    auth_phase: u8,
+    /// Last handle created — used for related compound requests where
+    /// QUERY_INFO/CLOSE reference FileId=0xFFFFFFFF meaning "use CREATE's handle."
+    last_create_handle: u64,
 }
 
 impl SmbSession {
@@ -139,6 +142,16 @@ impl SmbSession {
             next_handle: 1,
             cache: AttrCache::new(),
             auth_phase: 0,
+            last_create_handle: 0,
+        }
+    }
+
+    /// Resolve FileId — handles 0xFFFFFFFFFFFFFFFF sentinel for related compounds.
+    fn resolve_fid(&self, fid: u64) -> u64 {
+        if fid == 0xFFFF_FFFF_FFFF_FFFF {
+            self.last_create_handle
+        } else {
+            fid
         }
     }
 
@@ -412,7 +425,7 @@ impl SmbSession {
         resp.push(0); // Reserved
         resp.extend_from_slice(&0x0000_0030u32.to_le_bytes()); // ShareFlags: manual caching
         resp.extend_from_slice(&0u32.to_le_bytes()); // Capabilities
-        resp.extend_from_slice(&MAXIMUM_ALLOWED.to_le_bytes()); // MaximalAccess
+        resp.extend_from_slice(&0x001F01FFu32.to_le_bytes()); // MaximalAccess: FILE_ALL_ACCESS
 
         let mut full_hdr = hdr.clone();
         full_hdr.tree_id = self.tree_id;
@@ -575,6 +588,7 @@ impl SmbSession {
         out: &mut Vec<u8>,
     ) {
         let handle_id = self.alloc_handle();
+        self.last_create_handle = handle_id;
         self.handles.insert(
             handle_id,
             OpenHandle {
@@ -615,7 +629,9 @@ impl SmbSession {
                                                           // CreateContexts
         resp.extend_from_slice(&0u32.to_le_bytes()); // CreateContextsOffset
         resp.extend_from_slice(&0u32.to_le_bytes()); // CreateContextsLength
+        resp.push(0); // 1-byte variable part padding (StructureSize=89 means 88 fixed + 1)
 
+        log::debug!("CREATE response ({} bytes):{}", resp.len(), hex_dump(&resp, 128));
         hdr.write_response(STATUS_SUCCESS, &resp, out);
     }
 
@@ -623,7 +639,7 @@ impl SmbSession {
 
     fn handle_close(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
         let fid = if body.len() >= 24 {
-            read_u64_le(body, 8) // FileId.Persistent
+            self.resolve_fid(read_u64_le(body, 8)) // FileId.Persistent
         } else {
             0
         };
@@ -652,7 +668,7 @@ impl SmbSession {
         }
         let length = read_u32_le(body, 4);
         let offset = read_u64_le(body, 8);
-        let fid = read_u64_le(body, 16);
+        let fid = self.resolve_fid(read_u64_le(body, 16));
 
         let handle = match self.handles.get_mut(&fid) {
             Some(h) => h,
@@ -709,7 +725,7 @@ impl SmbSession {
         let data_offset = read_u16_le(body, 2) as usize;
         let length = read_u32_le(body, 4) as usize;
         let offset = read_u64_le(body, 8);
-        let fid = read_u64_le(body, 16);
+        let fid = self.resolve_fid(read_u64_le(body, 16));
 
         let data_start = data_offset.saturating_sub(SMB2_HEADER_SIZE);
         if data_start + length > body.len() {
@@ -769,7 +785,7 @@ impl SmbSession {
         }
         let info_level = body[2];
         let flags = body[3];
-        let fid = read_u64_le(body, 8);
+        let fid = self.resolve_fid(read_u64_le(body, 8));
         let restart = flags & 0x01 != 0; // RESTART_SCANS
 
         let handle = match self.handles.get_mut(&fid) {
@@ -937,7 +953,7 @@ impl SmbSession {
         }
         let info_type = body[2];
         let file_info_class = body[3];
-        let fid = read_u64_le(body, 24);
+        let fid = self.resolve_fid(read_u64_le(body, 24));
 
         let handle = match self.handles.get(&fid) {
             Some(h) => h,
@@ -1112,7 +1128,7 @@ impl SmbSession {
         let file_info_class = body[3];
         let buf_length = read_u32_le(body, 4) as usize;
         let buf_offset = read_u16_le(body, 8) as usize;
-        let fid = read_u64_le(body, 16);
+        let fid = self.resolve_fid(read_u64_le(body, 16));
 
         let handle = match self.handles.get(&fid) {
             Some(h) => h,
