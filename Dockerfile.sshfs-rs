@@ -1,0 +1,19 @@
+# Stage 1: Build sshfs-rs from source
+FROM rust:1-alpine AS builder
+RUN apk add --no-cache musl-dev fuse3-dev pkgconf
+WORKDIR /src
+COPY sshfs-rs/ .
+RUN cargo build --release && strip target/release/sshfs-rs
+
+# Stage 2: Minimal runtime — sshfs-rs + samba
+FROM alpine:3.21
+RUN apk add --no-cache \
+        fuse3 openssh-client \
+        samba-server samba-common-tools && \
+    mkdir -p /root/.ssh /mnt /run/samba /etc/mounter
+COPY --from=builder /src/target/release/sshfs-rs /usr/local/bin/sshfs-rs
+COPY entrypoint.sh /entrypoint.sh
+COPY monitor.sh /monitor.sh
+RUN chmod +x /entrypoint.sh /monitor.sh && \
+    sed -i 's/sshfs /sshfs-rs /g; s/fusermount3/fusermount/g' /monitor.sh
+ENTRYPOINT ["/entrypoint.sh"]

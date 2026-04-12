@@ -1,0 +1,618 @@
+//! SFTP protocol implementation over an SSH subprocess.
+//!
+//! Spawns `ssh -s sftp` and speaks the binary SFTP protocol over pipes.
+//! No SSH library needed — uses the system's ssh binary (keys, config, agent all work).
+
+use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+
+// ── SFTP protocol constants ──────────────────────────────────────────
+
+// Packet types
+const SSH_FXP_INIT: u8 = 1;
+const SSH_FXP_VERSION: u8 = 2;
+const SSH_FXP_OPEN: u8 = 3;
+const SSH_FXP_CLOSE: u8 = 4;
+const SSH_FXP_READ: u8 = 5;
+const SSH_FXP_WRITE: u8 = 6;
+const SSH_FXP_LSTAT: u8 = 7;
+const SSH_FXP_SETSTAT: u8 = 9;
+const SSH_FXP_OPENDIR: u8 = 11;
+const SSH_FXP_READDIR: u8 = 12;
+const SSH_FXP_REMOVE: u8 = 13;
+const SSH_FXP_MKDIR: u8 = 14;
+const SSH_FXP_RMDIR: u8 = 15;
+const SSH_FXP_REALPATH: u8 = 16;
+const SSH_FXP_STAT: u8 = 17;
+const SSH_FXP_RENAME: u8 = 18;
+const SSH_FXP_SYMLINK: u8 = 20;
+
+// Response types
+const SSH_FXP_STATUS: u8 = 101;
+const SSH_FXP_HANDLE: u8 = 102;
+const SSH_FXP_DATA: u8 = 103;
+const SSH_FXP_NAME: u8 = 104;
+const SSH_FXP_ATTRS: u8 = 105;
+
+// Status codes
+const SSH_FX_OK: u32 = 0;
+const SSH_FX_EOF: u32 = 1;
+
+// Attribute flags
+const SSH_FILEXFER_ATTR_SIZE: u32 = 0x0000_0001;
+const SSH_FILEXFER_ATTR_UIDGID: u32 = 0x0000_0002;
+const SSH_FILEXFER_ATTR_PERMISSIONS: u32 = 0x0000_0004;
+const SSH_FILEXFER_ATTR_ACMODTIME: u32 = 0x0000_0008;
+const SSH_FILEXFER_ATTR_EXTENDED: u32 = 0x8000_0000;
+
+// Open flags
+const SSH_FXF_READ: u32 = 0x0000_0001;
+const SSH_FXF_WRITE: u32 = 0x0000_0002;
+pub const SSH_FXF_CREAT: u32 = 0x0000_0008;
+pub const SSH_FXF_TRUNC: u32 = 0x0000_0010;
+const SSH_FXF_EXCL: u32 = 0x0000_0020;
+const SSH_FXF_APPEND: u32 = 0x0000_0004;
+
+const SFTP_PROTO_VERSION: u32 = 3;
+const MAX_READ_SIZE: u32 = 65536;
+const MAX_WRITE_SIZE: u32 = 65536;
+
+// ── Types ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct FileAttr {
+    pub size: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub perm: u32,
+    pub atime: u32,
+    pub mtime: u32,
+}
+
+impl Default for FileAttr {
+    fn default() -> Self {
+        Self { size: 0, uid: 0, gid: 0, perm: 0o644, atime: 0, mtime: 0 }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: String,
+    pub attrs: FileAttr,
+}
+
+pub type SftpResult<T> = Result<T, SftpError>;
+
+#[derive(Debug)]
+pub enum SftpError {
+    Io(io::Error),
+    Protocol(String),
+    Status(u32, String),
+    Disconnected,
+}
+
+impl From<io::Error> for SftpError {
+    fn from(e: io::Error) -> Self { SftpError::Io(e) }
+}
+
+impl std::fmt::Display for SftpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            SftpError::Io(e) => write!(f, "IO: {e}"),
+            SftpError::Protocol(s) => write!(f, "Protocol: {s}"),
+            SftpError::Status(c, s) => write!(f, "SFTP status {c}: {s}"),
+            SftpError::Disconnected => write!(f, "Disconnected"),
+        }
+    }
+}
+
+// ── Buffer helpers (SFTP wire format) ────────────────────────────────
+
+struct Buf(Vec<u8>);
+
+impl Buf {
+    fn new() -> Self { Buf(Vec::with_capacity(256)) }
+    fn with_capacity(n: usize) -> Self { Buf(Vec::with_capacity(n)) }
+
+    fn put_u8(&mut self, v: u8) { self.0.push(v); }
+    fn put_u32(&mut self, v: u32) { self.0.extend_from_slice(&v.to_be_bytes()); }
+    fn put_u64(&mut self, v: u64) { self.0.extend_from_slice(&v.to_be_bytes()); }
+    fn put_str(&mut self, s: &str) {
+        self.put_u32(s.len() as u32);
+        self.0.extend_from_slice(s.as_bytes());
+    }
+    fn put_bytes(&mut self, b: &[u8]) {
+        self.put_u32(b.len() as u32);
+        self.0.extend_from_slice(b);
+    }
+    fn put_attrs(&mut self, attrs: &FileAttr) {
+        let mut flags = 0u32;
+        flags |= SSH_FILEXFER_ATTR_SIZE;
+        flags |= SSH_FILEXFER_ATTR_UIDGID;
+        flags |= SSH_FILEXFER_ATTR_PERMISSIONS;
+        flags |= SSH_FILEXFER_ATTR_ACMODTIME;
+        self.put_u32(flags);
+        self.put_u64(attrs.size);
+        self.put_u32(attrs.uid);
+        self.put_u32(attrs.gid);
+        self.put_u32(attrs.perm);
+        self.put_u32(attrs.atime);
+        self.put_u32(attrs.mtime);
+    }
+}
+
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8]) -> Self { Reader { data, pos: 0 } }
+
+    fn remaining(&self) -> usize { self.data.len() - self.pos }
+
+    fn get_u8(&mut self) -> SftpResult<u8> {
+        if self.pos >= self.data.len() {
+            return Err(SftpError::Protocol("buffer underflow".into()));
+        }
+        let v = self.data[self.pos];
+        self.pos += 1;
+        Ok(v)
+    }
+
+    fn get_u32(&mut self) -> SftpResult<u32> {
+        if self.pos + 4 > self.data.len() {
+            return Err(SftpError::Protocol("buffer underflow".into()));
+        }
+        let v = u32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        Ok(v)
+    }
+
+    fn get_u64(&mut self) -> SftpResult<u64> {
+        if self.pos + 8 > self.data.len() {
+            return Err(SftpError::Protocol("buffer underflow".into()));
+        }
+        let v = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+        self.pos += 8;
+        Ok(v)
+    }
+
+    fn get_bytes(&mut self) -> SftpResult<Vec<u8>> {
+        let len = self.get_u32()? as usize;
+        if self.pos + len > self.data.len() {
+            return Err(SftpError::Protocol("buffer underflow".into()));
+        }
+        let v = self.data[self.pos..self.pos + len].to_vec();
+        self.pos += len;
+        Ok(v)
+    }
+
+    fn get_string(&mut self) -> SftpResult<String> {
+        let b = self.get_bytes()?;
+        String::from_utf8(b).map_err(|e| SftpError::Protocol(format!("invalid UTF-8: {e}")))
+    }
+
+    fn get_attrs(&mut self) -> SftpResult<FileAttr> {
+        let flags = self.get_u32()?;
+        let mut a = FileAttr::default();
+
+        if flags & SSH_FILEXFER_ATTR_SIZE != 0 {
+            a.size = self.get_u64()?;
+        }
+        if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
+            a.uid = self.get_u32()?;
+            a.gid = self.get_u32()?;
+        }
+        if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
+            a.perm = self.get_u32()?;
+        }
+        if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
+            a.atime = self.get_u32()?;
+            a.mtime = self.get_u32()?;
+        }
+        if flags & SSH_FILEXFER_ATTR_EXTENDED != 0 {
+            let count = self.get_u32()?;
+            for _ in 0..count {
+                let _ = self.get_bytes()?; // name
+                let _ = self.get_bytes()?; // value
+            }
+        }
+        Ok(a)
+    }
+}
+
+// ── SFTP Session ─────────────────────────────────────────────────────
+
+pub struct SftpSession {
+    reader: Mutex<Box<dyn Read + Send>>,
+    writer: Mutex<Box<dyn Write + Send>>,
+    next_id: AtomicU32,
+}
+
+impl SftpSession {
+    /// Connect to remote host by spawning `ssh -s sftp`.
+    pub fn connect(host: &str, port: u16, user: Option<&str>, identity: Option<&str>) -> SftpResult<Self> {
+        let (our_sock, child_sock) = UnixStream::pair()?;
+
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-oStrictHostKeyChecking=accept-new")
+           .arg("-oServerAliveInterval=15")
+           .arg("-oServerAliveCountMax=3")
+           .arg("-oBatchMode=yes");
+
+        if port != 22 {
+            cmd.arg("-p").arg(port.to_string());
+        }
+        if let Some(id) = identity {
+            cmd.arg("-i").arg(id);
+        }
+
+        let target = match user {
+            Some(u) => format!("{u}@{host}"),
+            None => host.to_string(),
+        };
+        cmd.arg(&target).arg("-s").arg("sftp");
+
+        let stdin_fd: OwnedFd = child_sock.try_clone()?.into();
+        let stdout_fd: OwnedFd = child_sock.into();
+        cmd.stdin(Stdio::from(stdin_fd))
+           .stdout(Stdio::from(stdout_fd))
+           .stderr(Stdio::inherit());
+
+        let _child = cmd.spawn().map_err(|e| {
+            SftpError::Io(io::Error::new(io::ErrorKind::Other, format!("ssh spawn: {e}")))
+        })?;
+
+        let reader = our_sock.try_clone()?;
+        let writer = our_sock;
+
+        let session = SftpSession {
+            reader: Mutex::new(Box::new(reader)),
+            writer: Mutex::new(Box::new(writer)),
+            next_id: AtomicU32::new(1),
+        };
+
+        session.sftp_init()?;
+        Ok(session)
+    }
+
+    fn next_id(&self) -> u32 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    // ── Low-level I/O ────────────────────────────────────────────────
+
+    fn send(&self, pkt_type: u8, id: u32, payload: &[u8]) -> SftpResult<()> {
+        let total_len = 1 + 4 + payload.len(); // type + id + payload
+        let mut msg = Vec::with_capacity(4 + total_len);
+        msg.extend_from_slice(&(total_len as u32).to_be_bytes());
+        msg.push(pkt_type);
+        msg.extend_from_slice(&id.to_be_bytes());
+        msg.extend_from_slice(payload);
+
+        let mut w = self.writer.lock().unwrap();
+        w.write_all(&msg).map_err(|_| SftpError::Disconnected)?;
+        w.flush().map_err(|_| SftpError::Disconnected)
+    }
+
+    fn send_no_id(&self, pkt_type: u8, payload: &[u8]) -> SftpResult<()> {
+        let total_len = 1 + payload.len();
+        let mut msg = Vec::with_capacity(4 + total_len);
+        msg.extend_from_slice(&(total_len as u32).to_be_bytes());
+        msg.push(pkt_type);
+        msg.extend_from_slice(payload);
+
+        let mut w = self.writer.lock().unwrap();
+        w.write_all(&msg).map_err(|_| SftpError::Disconnected)?;
+        w.flush().map_err(|_| SftpError::Disconnected)
+    }
+
+    fn recv(&self) -> SftpResult<(u8, Vec<u8>)> {
+        let mut r = self.reader.lock().unwrap();
+
+        let mut lenbuf = [0u8; 4];
+        r.read_exact(&mut lenbuf).map_err(|_| SftpError::Disconnected)?;
+        let len = u32::from_be_bytes(lenbuf) as usize;
+
+        if len == 0 || len > 256 * 1024 {
+            return Err(SftpError::Protocol(format!("bad packet length: {len}")));
+        }
+
+        let mut data = vec![0u8; len];
+        r.read_exact(&mut data).map_err(|_| SftpError::Disconnected)?;
+
+        let pkt_type = data[0];
+        Ok((pkt_type, data[1..].to_vec()))
+    }
+
+    /// Send request and receive matching response.
+    fn request(&self, pkt_type: u8, payload: &[u8]) -> SftpResult<(u8, Vec<u8>)> {
+        let id = self.next_id();
+        self.send(pkt_type, id, payload)?;
+
+        // Read response (simple synchronous model — one request at a time per lock)
+        let (resp_type, resp_data) = self.recv()?;
+
+        // Verify ID matches (skip for VERSION which has no id)
+        if resp_type != SSH_FXP_VERSION && resp_data.len() >= 4 {
+            let resp_id = u32::from_be_bytes(resp_data[0..4].try_into().unwrap());
+            if resp_id != id {
+                return Err(SftpError::Protocol(format!(
+                    "id mismatch: sent {id}, got {resp_id}"
+                )));
+            }
+        }
+
+        Ok((resp_type, resp_data))
+    }
+
+    fn check_status(&self, resp_type: u8, data: &[u8]) -> SftpResult<()> {
+        if resp_type != SSH_FXP_STATUS {
+            return Err(SftpError::Protocol(format!("expected STATUS, got {resp_type}")));
+        }
+        let mut r = Reader::new(&data[4..]); // skip id
+        let code = r.get_u32()?;
+        if code == SSH_FX_OK {
+            return Ok(());
+        }
+        let msg = r.get_string().unwrap_or_default();
+        Err(SftpError::Status(code, msg))
+    }
+
+    // ── SFTP init ────────────────────────────────────────────────────
+
+    fn sftp_init(&self) -> SftpResult<()> {
+        let mut buf = Buf::new();
+        buf.put_u32(SFTP_PROTO_VERSION);
+        self.send_no_id(SSH_FXP_INIT, &buf.0)?;
+
+        let (ptype, data) = self.recv()?;
+        if ptype != SSH_FXP_VERSION {
+            return Err(SftpError::Protocol(format!("expected VERSION, got {ptype}")));
+        }
+        let version = u32::from_be_bytes(data[0..4].try_into().unwrap());
+        log::info!("SFTP server version: {version}");
+        Ok(())
+    }
+
+    // ── Public API ───────────────────────────────────────────────────
+
+    pub fn realpath(&self, path: &str) -> SftpResult<String> {
+        let mut buf = Buf::new();
+        buf.put_str(path);
+        let (t, data) = self.request(SSH_FXP_REALPATH, &buf.0)?;
+        if t == SSH_FXP_STATUS {
+            self.check_status(t, &data)?;
+            unreachable!();
+        }
+        if t != SSH_FXP_NAME {
+            return Err(SftpError::Protocol(format!("expected NAME, got {t}")));
+        }
+        let mut r = Reader::new(&data[4..]); // skip id
+        let count = r.get_u32()?;
+        if count == 0 {
+            return Err(SftpError::Protocol("empty realpath response".into()));
+        }
+        r.get_string()
+    }
+
+    pub fn stat(&self, path: &str) -> SftpResult<FileAttr> {
+        let mut buf = Buf::new();
+        buf.put_str(path);
+        let (t, data) = self.request(SSH_FXP_STAT, &buf.0)?;
+        if t == SSH_FXP_STATUS {
+            self.check_status(t, &data)?;
+            unreachable!();
+        }
+        if t != SSH_FXP_ATTRS {
+            return Err(SftpError::Protocol(format!("expected ATTRS, got {t}")));
+        }
+        Reader::new(&data[4..]).get_attrs()
+    }
+
+    pub fn lstat(&self, path: &str) -> SftpResult<FileAttr> {
+        let mut buf = Buf::new();
+        buf.put_str(path);
+        let (t, data) = self.request(SSH_FXP_LSTAT, &buf.0)?;
+        if t == SSH_FXP_STATUS {
+            self.check_status(t, &data)?;
+            unreachable!();
+        }
+        if t != SSH_FXP_ATTRS {
+            return Err(SftpError::Protocol(format!("expected ATTRS, got {t}")));
+        }
+        Reader::new(&data[4..]).get_attrs()
+    }
+
+    pub fn setstat(&self, path: &str, attrs: &FileAttr) -> SftpResult<()> {
+        let mut buf = Buf::new();
+        buf.put_str(path);
+        buf.put_attrs(attrs);
+        let (t, data) = self.request(SSH_FXP_SETSTAT, &buf.0)?;
+        self.check_status(t, &data)
+    }
+
+    pub fn readdir(&self, path: &str) -> SftpResult<Vec<DirEntry>> {
+        // Open directory
+        let mut buf = Buf::new();
+        buf.put_str(path);
+        let (t, data) = self.request(SSH_FXP_OPENDIR, &buf.0)?;
+        if t == SSH_FXP_STATUS {
+            self.check_status(t, &data)?;
+            unreachable!();
+        }
+        if t != SSH_FXP_HANDLE {
+            return Err(SftpError::Protocol(format!("expected HANDLE, got {t}")));
+        }
+        let handle = Reader::new(&data[4..]).get_bytes()?;
+
+        // Read entries
+        let mut entries = Vec::new();
+        loop {
+            let mut rbuf = Buf::new();
+            rbuf.put_bytes(&handle);
+            let (t, data) = self.request(SSH_FXP_READDIR, &rbuf.0)?;
+
+            if t == SSH_FXP_STATUS {
+                let mut sr = Reader::new(&data[4..]);
+                let code = sr.get_u32()?;
+                if code == SSH_FX_EOF {
+                    break;
+                }
+                let msg = sr.get_string().unwrap_or_default();
+                // Close handle before returning error
+                let _ = self.close_handle(&handle);
+                return Err(SftpError::Status(code, msg));
+            }
+
+            if t != SSH_FXP_NAME {
+                let _ = self.close_handle(&handle);
+                return Err(SftpError::Protocol(format!("expected NAME, got {t}")));
+            }
+
+            let mut r = Reader::new(&data[4..]);
+            let count = r.get_u32()?;
+            for _ in 0..count {
+                let name = r.get_string()?;
+                let _longname = r.get_string()?; // ls -l style, unused
+                let attrs = r.get_attrs()?;
+
+                if name != "." && name != ".." {
+                    entries.push(DirEntry { name, attrs });
+                }
+            }
+        }
+
+        self.close_handle(&handle)?;
+        Ok(entries)
+    }
+
+    pub fn open(&self, path: &str, flags: u32, mode: u32) -> SftpResult<Vec<u8>> {
+        let mut buf = Buf::new();
+        buf.put_str(path);
+        buf.put_u32(flags);
+
+        // Attrs with permissions
+        let mut attr_flags = 0u32;
+        if flags & SSH_FXF_CREAT != 0 {
+            attr_flags |= SSH_FILEXFER_ATTR_PERMISSIONS;
+        }
+        buf.put_u32(attr_flags);
+        if attr_flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
+            buf.put_u32(mode);
+        }
+
+        let (t, data) = self.request(SSH_FXP_OPEN, &buf.0)?;
+        if t == SSH_FXP_STATUS {
+            self.check_status(t, &data)?;
+            unreachable!();
+        }
+        if t != SSH_FXP_HANDLE {
+            return Err(SftpError::Protocol(format!("expected HANDLE, got {t}")));
+        }
+        Reader::new(&data[4..]).get_bytes()
+    }
+
+    fn close_handle(&self, handle: &[u8]) -> SftpResult<()> {
+        let mut buf = Buf::new();
+        buf.put_bytes(handle);
+        let (t, data) = self.request(SSH_FXP_CLOSE, &buf.0)?;
+        self.check_status(t, &data)
+    }
+
+    pub fn close(&self, handle: &[u8]) -> SftpResult<()> {
+        self.close_handle(handle)
+    }
+
+    pub fn read(&self, handle: &[u8], offset: u64, len: u32) -> SftpResult<Vec<u8>> {
+        let len = len.min(MAX_READ_SIZE);
+        let mut buf = Buf::new();
+        buf.put_bytes(handle);
+        buf.put_u64(offset);
+        buf.put_u32(len);
+
+        let (t, data) = self.request(SSH_FXP_READ, &buf.0)?;
+        if t == SSH_FXP_STATUS {
+            let mut sr = Reader::new(&data[4..]);
+            let code = sr.get_u32()?;
+            if code == SSH_FX_EOF {
+                return Ok(Vec::new());
+            }
+            let msg = sr.get_string().unwrap_or_default();
+            return Err(SftpError::Status(code, msg));
+        }
+        if t != SSH_FXP_DATA {
+            return Err(SftpError::Protocol(format!("expected DATA, got {t}")));
+        }
+        Reader::new(&data[4..]).get_bytes()
+    }
+
+    pub fn write(&self, handle: &[u8], offset: u64, data: &[u8]) -> SftpResult<()> {
+        let mut buf = Buf::with_capacity(data.len() + 32);
+        buf.put_bytes(handle);
+        buf.put_u64(offset);
+        buf.put_bytes(data);
+
+        let (t, resp) = self.request(SSH_FXP_WRITE, &buf.0)?;
+        self.check_status(t, &resp)
+    }
+
+    pub fn mkdir(&self, path: &str, mode: u32) -> SftpResult<()> {
+        let mut buf = Buf::new();
+        buf.put_str(path);
+        buf.put_u32(SSH_FILEXFER_ATTR_PERMISSIONS);
+        buf.put_u32(mode);
+        let (t, data) = self.request(SSH_FXP_MKDIR, &buf.0)?;
+        self.check_status(t, &data)
+    }
+
+    pub fn rmdir(&self, path: &str) -> SftpResult<()> {
+        let mut buf = Buf::new();
+        buf.put_str(path);
+        let (t, data) = self.request(SSH_FXP_RMDIR, &buf.0)?;
+        self.check_status(t, &data)
+    }
+
+    pub fn remove(&self, path: &str) -> SftpResult<()> {
+        let mut buf = Buf::new();
+        buf.put_str(path);
+        let (t, data) = self.request(SSH_FXP_REMOVE, &buf.0)?;
+        self.check_status(t, &data)
+    }
+
+    pub fn rename(&self, from: &str, to: &str) -> SftpResult<()> {
+        let mut buf = Buf::new();
+        buf.put_str(from);
+        buf.put_str(to);
+        let (t, data) = self.request(SSH_FXP_RENAME, &buf.0)?;
+        self.check_status(t, &data)
+    }
+
+    pub fn symlink(&self, target: &str, link: &str) -> SftpResult<()> {
+        let mut buf = Buf::new();
+        buf.put_str(target);
+        buf.put_str(link);
+        let (t, data) = self.request(SSH_FXP_SYMLINK, &buf.0)?;
+        self.check_status(t, &data)
+    }
+
+    // ── Convenience: open flags from POSIX ───────────────────────────
+
+    pub fn open_flags_from_libc(flags: i32) -> u32 {
+        let mut sf = 0u32;
+        let accmode = flags & libc::O_ACCMODE;
+        if accmode == libc::O_RDONLY { sf |= SSH_FXF_READ; }
+        if accmode == libc::O_WRONLY { sf |= SSH_FXF_WRITE; }
+        if accmode == libc::O_RDWR   { sf |= SSH_FXF_READ | SSH_FXF_WRITE; }
+        if flags & libc::O_CREAT != 0 { sf |= SSH_FXF_CREAT; }
+        if flags & libc::O_TRUNC != 0 { sf |= SSH_FXF_TRUNC; }
+        if flags & libc::O_EXCL  != 0 { sf |= SSH_FXF_EXCL; }
+        if flags & libc::O_APPEND != 0 { sf |= SSH_FXF_APPEND; }
+        sf
+    }
+}
