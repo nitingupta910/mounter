@@ -445,7 +445,7 @@ impl SmbSession {
     // ── CREATE (open file/directory) ────────────────────────────────
 
     fn handle_create(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
-        if body.len() < 57 {
+        if body.len() < 48 {
             self.error_response(hdr, STATUS_INVALID_PARAMETER, out);
             return;
         }
@@ -662,7 +662,7 @@ impl SmbSession {
     // ── READ ────────────────────────────────────────────────────────
 
     fn handle_read(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
-        if body.len() < 49 {
+        if body.len() < 32 {
             self.error_response(hdr, STATUS_INVALID_PARAMETER, out);
             return;
         }
@@ -718,7 +718,7 @@ impl SmbSession {
     // ── WRITE ───────────────────────────────────────────────────────
 
     fn handle_write(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
-        if body.len() < 49 {
+        if body.len() < 32 {
             self.error_response(hdr, STATUS_INVALID_PARAMETER, out);
             return;
         }
@@ -779,7 +779,7 @@ impl SmbSession {
     // ── QUERY_DIRECTORY ─────────────────────────────────────────────
 
     fn handle_query_directory(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
-        if body.len() < 33 {
+        if body.len() < 24 {
             self.error_response(hdr, STATUS_INVALID_PARAMETER, out);
             return;
         }
@@ -947,13 +947,14 @@ impl SmbSession {
     // ── QUERY_INFO ──────────────────────────────────────────────────
 
     fn handle_query_info(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
-        if body.len() < 41 {
+        if body.len() < 32 {
             self.error_response(hdr, STATUS_INVALID_PARAMETER, out);
             return;
         }
         let info_type = body[2];
         let file_info_class = body[3];
         let fid = self.resolve_fid(read_u64_le(body, 24));
+        log::info!("QUERY_INFO: type={info_type} class={file_info_class} fid={fid}");
 
         let handle = match self.handles.get(&fid) {
             Some(h) => h,
@@ -1120,7 +1121,7 @@ impl SmbSession {
     // ── SET_INFO ────────────────────────────────────────────────────
 
     fn handle_set_info(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
-        if body.len() < 33 {
+        if body.len() < 24 {
             self.error_response(hdr, STATUS_INVALID_PARAMETER, out);
             return;
         }
