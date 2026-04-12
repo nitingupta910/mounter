@@ -81,14 +81,18 @@ struct CachedAttr {
     expires: Instant,
 }
 
+const NEG_CACHE_TTL: Duration = Duration::from_secs(15);
+
 struct AttrCache {
     entries: HashMap<String, CachedAttr>,
+    negative: HashMap<String, Instant>, // path → expiry for "not found"
 }
 
 impl AttrCache {
     fn new() -> Self {
         AttrCache {
             entries: HashMap::new(),
+            negative: HashMap::new(),
         }
     }
 
@@ -102,7 +106,16 @@ impl AttrCache {
         })
     }
 
+    /// Returns true if this path is known to not exist (negative cached).
+    fn is_negative(&self, path: &str) -> bool {
+        self.negative
+            .get(path)
+            .map(|exp| *exp > Instant::now())
+            .unwrap_or(false)
+    }
+
     fn insert(&mut self, path: String, attr: FileAttr) {
+        self.negative.remove(&path); // clear negative if it existed
         self.entries.insert(
             path,
             CachedAttr {
@@ -112,15 +125,30 @@ impl AttrCache {
         );
     }
 
+    /// Cache that a path does not exist. Avoids repeated SFTP lookups
+    /// for Apple metadata files (._*, .DS_Store, .localized).
+    fn insert_negative(&mut self, path: String) {
+        self.negative.insert(path, Instant::now() + NEG_CACHE_TTL);
+    }
+
     fn invalidate(&mut self, path: &str) {
         self.entries.remove(path);
+        self.negative.remove(path);
     }
 
     /// Invalidate a path and its parent (for mutations that change directory mtime).
     fn invalidate_with_parent(&mut self, path: &str) {
         self.entries.remove(path);
+        self.negative.remove(path);
         if let Some(parent) = parent_path(path) {
             self.entries.remove(&parent);
+            // Also clear negative cache for the parent dir — new files may appear
+            let prefix = if parent.ends_with('/') {
+                parent.clone()
+            } else {
+                format!("{parent}/")
+            };
+            self.negative.retain(|k, _| !k.starts_with(&prefix));
         }
     }
 
@@ -128,6 +156,7 @@ impl AttrCache {
     fn prune(&mut self) {
         let now = Instant::now();
         self.entries.retain(|_, v| v.expires > now);
+        self.negative.retain(|_, exp| *exp > now);
     }
 }
 
@@ -290,11 +319,15 @@ impl Filesystem for SshFilesystem {
         let child_name = name.to_string_lossy();
         let child_path = join_path(&parent_path, &child_name);
 
-        // Check cache first
+        // Check positive + negative cache first
         if let Ok(cache) = self.cache.lock() {
             if let Some(a) = cache.get(&child_path) {
                 let ino = lock_or!(self.inodes, reply).get_or_insert(&child_path);
                 reply.entry(&TTL, &sftp_attr_to_fuse(ino, a), 0);
+                return;
+            }
+            if cache.is_negative(&child_path) {
+                reply.error(ENOENT);
                 return;
             }
         }
@@ -305,6 +338,13 @@ impl Filesystem for SshFilesystem {
                     cache.insert(child_path, a.clone());
                 }
                 reply.entry(&TTL, &sftp_attr_to_fuse(ino, &a), 0);
+            }
+            Err(ref e) if matches!(e, SftpError::Status(2, _)) => {
+                // ENOENT — cache the negative result
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert_negative(child_path);
+                }
+                reply.error(ENOENT);
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
         }

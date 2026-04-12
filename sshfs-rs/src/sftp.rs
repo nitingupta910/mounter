@@ -58,8 +58,9 @@ const SSH_FXF_EXCL: u32 = 0x0000_0020;
 const SSH_FXF_APPEND: u32 = 0x0000_0004;
 
 const SFTP_PROTO_VERSION: u32 = 3;
-const MAX_READ_SIZE: u32 = 65536;
-const MAX_WRITE_SIZE: u32 = 65536;
+const MAX_READ_SIZE: u32 = 262144; // 256KB — most servers support this
+const MAX_WRITE_SIZE: u32 = 262144;
+const READDIR_PIPELINE: usize = 8; // concurrent READDIR requests
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -334,16 +335,35 @@ impl SftpSession {
 
     // ── Low-level I/O ────────────────────────────────────────────────
 
-    fn send(&self, pkt_type: u8, id: u32, payload: &[u8]) -> SftpResult<()> {
-        let total_len = 1 + 4 + payload.len(); // type + id + payload
+    /// Write a packet to an already-locked writer.
+    fn write_packet(w: &mut dyn Write, pkt_type: u8, id: u32, payload: &[u8]) -> SftpResult<()> {
+        let total_len = 1 + 4 + payload.len();
         let mut msg = Vec::with_capacity(4 + total_len);
         msg.extend_from_slice(&(total_len as u32).to_be_bytes());
         msg.push(pkt_type);
         msg.extend_from_slice(&id.to_be_bytes());
         msg.extend_from_slice(payload);
+        w.write_all(&msg).map_err(|_| SftpError::Disconnected)
+    }
 
+    /// Read a packet from an already-locked reader.
+    fn read_packet(r: &mut dyn Read) -> SftpResult<(u8, Vec<u8>)> {
+        let mut lenbuf = [0u8; 4];
+        r.read_exact(&mut lenbuf)
+            .map_err(|_| SftpError::Disconnected)?;
+        let len = u32::from_be_bytes(lenbuf) as usize;
+        if len == 0 || len > 512 * 1024 {
+            return Err(SftpError::Protocol(format!("bad packet length: {len}")));
+        }
+        let mut data = vec![0u8; len];
+        r.read_exact(&mut data)
+            .map_err(|_| SftpError::Disconnected)?;
+        Ok((data[0], data[1..].to_vec()))
+    }
+
+    fn send(&self, pkt_type: u8, id: u32, payload: &[u8]) -> SftpResult<()> {
         let mut w = self.writer.lock().map_err(|_| SftpError::Disconnected)?;
-        w.write_all(&msg).map_err(|_| SftpError::Disconnected)?;
+        Self::write_packet(&mut *w, pkt_type, id, payload)?;
         w.flush().map_err(|_| SftpError::Disconnected)
     }
 
@@ -361,22 +381,7 @@ impl SftpSession {
 
     fn recv(&self) -> SftpResult<(u8, Vec<u8>)> {
         let mut r = self.reader.lock().map_err(|_| SftpError::Disconnected)?;
-
-        let mut lenbuf = [0u8; 4];
-        r.read_exact(&mut lenbuf)
-            .map_err(|_| SftpError::Disconnected)?;
-        let len = u32::from_be_bytes(lenbuf) as usize;
-
-        if len == 0 || len > 256 * 1024 {
-            return Err(SftpError::Protocol(format!("bad packet length: {len}")));
-        }
-
-        let mut data = vec![0u8; len];
-        r.read_exact(&mut data)
-            .map_err(|_| SftpError::Disconnected)?;
-
-        let pkt_type = data[0];
-        Ok((pkt_type, data[1..].to_vec()))
+        Self::read_packet(&mut *r)
     }
 
     /// Send request and receive matching response.
@@ -492,7 +497,7 @@ impl SftpSession {
     }
 
     pub fn readdir(&self, path: &str) -> SftpResult<Vec<DirEntry>> {
-        // Open directory
+        // Open directory (1 round-trip)
         let mut buf = Buf::new();
         buf.put_str(path);
         let (t, data) = self.request(SSH_FXP_OPENDIR, &buf.0)?;
@@ -505,21 +510,39 @@ impl SftpSession {
         }
         let handle = Reader::new(&data[4..]).get_bytes()?;
 
-        // Read entries
+        // Pipelined READDIR: send READDIR_PIPELINE requests at once, then read
+        // responses. Keeps the network saturated instead of waiting for each
+        // response before sending the next request.
         let mut entries = Vec::new();
-        loop {
-            let mut rbuf = Buf::new();
-            rbuf.put_bytes(&handle);
-            let (t, data) = self.request(SSH_FXP_READDIR, &rbuf.0)?;
+        let mut eof = false;
+        let mut pending: usize = 0;
+
+        // Prime the pipeline — send initial batch
+        {
+            let mut w = self.writer.lock().map_err(|_| SftpError::Disconnected)?;
+            for _ in 0..READDIR_PIPELINE {
+                let id = self.next_id();
+                let mut rbuf = Buf::new();
+                rbuf.put_bytes(&handle);
+                Self::write_packet(&mut *w, SSH_FXP_READDIR, id, &rbuf.0)?;
+                pending += 1;
+            }
+            w.flush().map_err(|_| SftpError::Disconnected)?;
+        }
+
+        // Read responses, refilling pipeline as we go
+        while pending > 0 {
+            let (t, data) = self.recv()?;
+            pending -= 1;
 
             if t == SSH_FXP_STATUS {
                 let mut sr = Reader::new(&data[4..]);
                 let code = sr.get_u32()?;
                 if code == SSH_FX_EOF {
-                    break;
+                    eof = true;
+                    continue; // drain remaining pending responses
                 }
                 let msg = sr.get_string().unwrap_or_default();
-                // Close handle before returning error
                 let _ = self.close_handle(&handle);
                 return Err(SftpError::Status(code, msg));
             }
@@ -529,16 +552,27 @@ impl SftpSession {
                 return Err(SftpError::Protocol(format!("expected NAME, got {t}")));
             }
 
+            // Parse entries from this batch
             let mut r = Reader::new(&data[4..]);
             let count = r.get_u32()?;
             for _ in 0..count {
                 let name = r.get_string()?;
-                let _longname = r.get_string()?; // ls -l style, unused
+                let _longname = r.get_string()?;
                 let attrs = r.get_attrs()?;
-
                 if name != "." && name != ".." {
                     entries.push(DirEntry { name, attrs });
                 }
+            }
+
+            // Keep pipeline full: send another request if not EOF
+            if !eof {
+                let mut w = self.writer.lock().map_err(|_| SftpError::Disconnected)?;
+                let id = self.next_id();
+                let mut rbuf = Buf::new();
+                rbuf.put_bytes(&handle);
+                Self::write_packet(&mut *w, SSH_FXP_READDIR, id, &rbuf.0)?;
+                w.flush().map_err(|_| SftpError::Disconnected)?;
+                pending += 1;
             }
         }
 
