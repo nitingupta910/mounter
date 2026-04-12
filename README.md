@@ -15,14 +15,15 @@ cp target/release/mounter /usr/local/bin/
 ```bash
 mounter mount server:/home/user
 mounter mount user@server:/data -n mydata
+mounter mount server:/path ~/mydir        # custom mount destination
 mounter list
 mounter status
 mounter unmount server
 ```
 
-Files appear at `~/mnt/<name>`. Open in Finder with `open ~/mnt/server`.
+Files appear at `~/mnt/<name>` by default. Open in Finder with `open ~/mnt/server`.
 
-The Docker image (Alpine + sshfs-rs + Samba) is built automatically on first mount (~2 min, then cached). The container starts and stops as needed — no manual Docker setup required.
+The Docker image is built automatically on first mount (~2 min, then cached). The container starts and stops as needed — no manual Docker setup required. Or build explicitly with `make build-sshfs`.
 
 ## Requirements
 
