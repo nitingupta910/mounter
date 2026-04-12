@@ -1,6 +1,8 @@
 # Stage 1: Build sshfs-rs from source
-FROM rust:1-alpine AS builder
-RUN apk add --no-cache musl-dev fuse3-dev pkgconf
+FROM rust:latest AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libfuse3-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY sshfs-rs/ .
 RUN cargo build --release && strip target/release/sshfs-rs
