@@ -40,11 +40,15 @@ fn main() {
         match args[i].as_str() {
             "-p" => {
                 i += 1;
-                port = args[i].parse().expect("bad port");
+                port = args
+                    .get(i)
+                    .expect("missing port value after -p")
+                    .parse()
+                    .expect("bad port");
             }
             "-i" => {
                 i += 1;
-                identity = Some(args[i].clone());
+                identity = Some(args.get(i).expect("missing path after -i").clone());
             }
             "-f" => {
                 foreground = true;

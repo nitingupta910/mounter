@@ -427,7 +427,7 @@ impl SftpSession {
         let (t, data) = self.request(SSH_FXP_REALPATH, &buf.0)?;
         if t == SSH_FXP_STATUS {
             self.check_status(t, &data)?;
-            unreachable!();
+            return Err(SftpError::Protocol("unexpected OK status".into()));
         }
         if t != SSH_FXP_NAME {
             return Err(SftpError::Protocol(format!("expected NAME, got {t}")));
@@ -446,7 +446,7 @@ impl SftpSession {
         let (t, data) = self.request(SSH_FXP_STAT, &buf.0)?;
         if t == SSH_FXP_STATUS {
             self.check_status(t, &data)?;
-            unreachable!();
+            return Err(SftpError::Protocol("unexpected OK status".into()));
         }
         if t != SSH_FXP_ATTRS {
             return Err(SftpError::Protocol(format!("expected ATTRS, got {t}")));
@@ -460,7 +460,7 @@ impl SftpSession {
         let (t, data) = self.request(SSH_FXP_LSTAT, &buf.0)?;
         if t == SSH_FXP_STATUS {
             self.check_status(t, &data)?;
-            unreachable!();
+            return Err(SftpError::Protocol("unexpected OK status".into()));
         }
         if t != SSH_FXP_ATTRS {
             return Err(SftpError::Protocol(format!("expected ATTRS, got {t}")));
@@ -483,7 +483,7 @@ impl SftpSession {
         let (t, data) = self.request(SSH_FXP_OPENDIR, &buf.0)?;
         if t == SSH_FXP_STATUS {
             self.check_status(t, &data)?;
-            unreachable!();
+            return Err(SftpError::Protocol("unexpected OK status".into()));
         }
         if t != SSH_FXP_HANDLE {
             return Err(SftpError::Protocol(format!("expected HANDLE, got {t}")));
@@ -549,7 +549,7 @@ impl SftpSession {
         let (t, data) = self.request(SSH_FXP_OPEN, &buf.0)?;
         if t == SSH_FXP_STATUS {
             self.check_status(t, &data)?;
-            unreachable!();
+            return Err(SftpError::Protocol("unexpected OK status".into()));
         }
         if t != SSH_FXP_HANDLE {
             return Err(SftpError::Protocol(format!("expected HANDLE, got {t}")));

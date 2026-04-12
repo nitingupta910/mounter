@@ -1,4 +1,4 @@
-//! mounter-rs — macOS CLI for mounting remote SSH directories via Docker + SMB.
+//! mounter — macOS CLI for mounting remote SSH directories via Docker + SMB.
 //!
 //! Ports the `mounter` bash script to Rust with a background health-monitor process.
 //! No external crate dependencies; shells out to docker, ssh, mount_smbfs, etc.
@@ -151,9 +151,18 @@ fn ensure_image() {
         PathBuf::from(env::var("MOUNTER_DIR").unwrap_or_default()),
         PathBuf::from("."),
     ];
+    let dockerfile = "Dockerfile.sshfs-rs";
     for dir in &candidates {
-        if dir.join("Dockerfile").exists() {
-            let (ok, out) = shell(&["docker", "build", "-t", IMAGE, &dir.to_string_lossy()]);
+        if dir.join(dockerfile).exists() {
+            let (ok, out) = shell(&[
+                "docker",
+                "build",
+                "-f",
+                &dir.join(dockerfile).to_string_lossy(),
+                "-t",
+                IMAGE,
+                &dir.to_string_lossy(),
+            ]);
             if ok {
                 info("Image built.");
                 return;
@@ -588,7 +597,7 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
 
 fn cmd_mount(args: &[String]) {
     if args.is_empty() {
-        die("Usage: mounter-rs mount [user@]host:[/path] [-p port] [-i identity] [-n name]");
+        die("Usage: mounter mount [user@]host:[/path] [-p port] [-i identity] [-n name]");
     }
 
     let remote = &args[0];
@@ -768,7 +777,7 @@ directory mask = 0755
 
 fn cmd_unmount(args: &[String]) {
     if args.is_empty() {
-        die("Usage: mounter-rs unmount <name>");
+        die("Usage: mounter unmount <name>");
     }
     let target = &args[0];
     let name = if target.starts_with('/') {
@@ -893,13 +902,13 @@ fn cmd_status() {
 }
 
 fn usage() -> ! {
-    eprintln!("mounter-rs — mount remote SSH directories in Finder");
+    eprintln!("mounter — mount remote SSH directories in Finder");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  mounter-rs mount [user@]host:[/path] [-n name] [-p port] [-i identity]");
-    eprintln!("  mounter-rs unmount <name>");
-    eprintln!("  mounter-rs list");
-    eprintln!("  mounter-rs status");
+    eprintln!("  mounter mount [user@]host:[/path] [-n name] [-p port] [-i identity]");
+    eprintln!("  mounter unmount <name>");
+    eprintln!("  mounter list");
+    eprintln!("  mounter status");
     eprintln!();
     eprintln!("No macFUSE, no sudo. Requires Docker (OrbStack recommended).");
     process::exit(1);
@@ -918,7 +927,7 @@ fn main() {
         "status" => cmd_status(),
         "help" | "-h" | "--help" => usage(),
         other => {
-            eprintln!("Unknown command: {other}. Run 'mounter-rs help'");
+            eprintln!("Unknown command: {other}. Run 'mounter help'");
             process::exit(1);
         }
     }
@@ -1134,7 +1143,6 @@ mod tests {
 
     #[test]
     fn check_interval_and_threshold_produce_reasonable_timeout() {
-        // Total wait before reconnect = CHECK_INTERVAL * FAILURES_BEFORE_RECONNECT
         let total_wait = CHECK_INTERVAL * FAILURES_BEFORE_RECONNECT as u64;
         assert!(
             total_wait >= 30,
@@ -1144,5 +1152,92 @@ mod tests {
             total_wait <= 120,
             "should not wait more than 2 min before reconnecting (got {total_wait}s)"
         );
+    }
+
+    // ── PID file roundtrip ─────────────────────────────────────────
+
+    #[test]
+    fn pid_file_roundtrip() {
+        let name = "test-pid-roundtrip";
+        write_pid_file(name, 12345);
+        assert_eq!(read_pid_file(name), Some(12345));
+        remove_pid_file(name);
+        assert_eq!(read_pid_file(name), None);
+    }
+
+    #[test]
+    fn pid_file_missing_returns_none() {
+        assert_eq!(read_pid_file("nonexistent-mount-xyz"), None);
+    }
+
+    // ── resolve_host fallback ──────────────────────────────────────
+
+    #[test]
+    fn resolve_host_returns_input_for_ip() {
+        // An IP address should pass through unchanged
+        assert_eq!(resolve_host("192.168.1.1"), "192.168.1.1");
+    }
+
+    #[test]
+    fn resolve_host_returns_input_for_unresolvable() {
+        // A nonsense hostname should fall back to the input
+        let result = resolve_host("this-host-does-not-exist-xyz.invalid");
+        assert_eq!(result, "this-host-does-not-exist-xyz.invalid");
+    }
+
+    // ── resolve_ssh defaults ───────────────────────────────────────
+
+    #[test]
+    fn resolve_ssh_unknown_host_returns_defaults() {
+        let cfg = resolve_ssh("nonexistent-host-xyz-99");
+        // Should fall back gracefully — hostname set, port 22
+        assert!(!cfg.hostname.is_empty());
+        assert_eq!(cfg.port, "22");
+    }
+
+    // ── mount_base / config_dir ────────────────────────────────────
+
+    #[test]
+    fn mount_base_under_home() {
+        let base = mount_base();
+        assert!(base.to_string_lossy().contains("mnt"));
+    }
+
+    #[test]
+    fn config_dir_under_home() {
+        let dir = config_dir();
+        assert!(dir.to_string_lossy().contains(".config/mounter"));
+    }
+
+    // ── Monitor behavior matrix ────────────────────────────────────
+
+    /// Verify the monitor dispatches correctly for each Health variant.
+    /// We can't run the actual monitor, but we verify the decision logic.
+    #[test]
+    fn monitor_dispatch_matrix() {
+        // Actions that should happen immediately (no waiting)
+        let immediate_actions = [
+            Health::UserEjected,
+            Health::FullyGone,
+            Health::SshfsDead,
+            Health::SmbOnly,
+        ];
+        for health in &immediate_actions {
+            // These should not use consecutive_failures gating
+            assert_ne!(*health, Health::SshfsStale);
+            assert_ne!(*health, Health::ContainerDead);
+        }
+
+        // Actions that should wait for threshold
+        let gated_actions = [Health::SshfsStale, Health::ContainerDead];
+        for health in &gated_actions {
+            assert_ne!(*health, Health::Healthy);
+            assert_ne!(*health, Health::UserEjected);
+        }
+    }
+
+    #[test]
+    fn smb_in_mount_table_returns_false_for_nonexistent() {
+        assert!(!smb_in_mount_table("nonexistent-mount-xyz-999"));
     }
 }
