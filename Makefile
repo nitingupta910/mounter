@@ -1,13 +1,16 @@
-.PHONY: build build-sshfs run-sshfs clean
+.PHONY: build build-cli build-sshfs run-sshfs install clean
 
 IMAGE = mounter-sshfs-rs
 CONTAINER = mounter
 
+# Build everything
+build: build-cli build-sshfs
+
 # Build the macOS CLI
-build:
+build-cli:
 	cd mounter && cargo build --release
 
-# Build the Docker image (sshfs-rs + samba, Alpine)
+# Build the Docker image (sshfs-rs + samba)
 build-sshfs:
 	docker build -f Dockerfile.sshfs-rs -t $(IMAGE) .
 
