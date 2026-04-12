@@ -6,7 +6,7 @@
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
@@ -75,7 +75,14 @@ pub struct FileAttr {
 
 impl Default for FileAttr {
     fn default() -> Self {
-        Self { size: 0, uid: 0, gid: 0, perm: 0o644, atime: 0, mtime: 0 }
+        Self {
+            size: 0,
+            uid: 0,
+            gid: 0,
+            perm: 0o644,
+            atime: 0,
+            mtime: 0,
+        }
     }
 }
 
@@ -96,7 +103,9 @@ pub enum SftpError {
 }
 
 impl From<io::Error> for SftpError {
-    fn from(e: io::Error) -> Self { SftpError::Io(e) }
+    fn from(e: io::Error) -> Self {
+        SftpError::Io(e)
+    }
 }
 
 impl std::fmt::Display for SftpError {
@@ -115,12 +124,22 @@ impl std::fmt::Display for SftpError {
 struct Buf(Vec<u8>);
 
 impl Buf {
-    fn new() -> Self { Buf(Vec::with_capacity(256)) }
-    fn with_capacity(n: usize) -> Self { Buf(Vec::with_capacity(n)) }
+    fn new() -> Self {
+        Buf(Vec::with_capacity(256))
+    }
+    fn with_capacity(n: usize) -> Self {
+        Buf(Vec::with_capacity(n))
+    }
 
-    fn put_u8(&mut self, v: u8) { self.0.push(v); }
-    fn put_u32(&mut self, v: u32) { self.0.extend_from_slice(&v.to_be_bytes()); }
-    fn put_u64(&mut self, v: u64) { self.0.extend_from_slice(&v.to_be_bytes()); }
+    fn put_u8(&mut self, v: u8) {
+        self.0.push(v);
+    }
+    fn put_u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn put_u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
     fn put_str(&mut self, s: &str) {
         self.put_u32(s.len() as u32);
         self.0.extend_from_slice(s.as_bytes());
@@ -151,9 +170,13 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Self { Reader { data, pos: 0 } }
+    fn new(data: &'a [u8]) -> Self {
+        Reader { data, pos: 0 }
+    }
 
-    fn remaining(&self) -> usize { self.data.len() - self.pos }
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
 
     fn get_u8(&mut self) -> SftpResult<u8> {
         if self.pos >= self.data.len() {
@@ -232,18 +255,24 @@ pub struct SftpSession {
     reader: Mutex<Box<dyn Read + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     next_id: AtomicU32,
+    _child: Mutex<Option<Child>>,
 }
 
 impl SftpSession {
     /// Connect to remote host by spawning `ssh -s sftp`.
-    pub fn connect(host: &str, port: u16, user: Option<&str>, identity: Option<&str>) -> SftpResult<Self> {
+    pub fn connect(
+        host: &str,
+        port: u16,
+        user: Option<&str>,
+        identity: Option<&str>,
+    ) -> SftpResult<Self> {
         let (our_sock, child_sock) = UnixStream::pair()?;
 
         let mut cmd = Command::new("ssh");
         cmd.arg("-oStrictHostKeyChecking=accept-new")
-           .arg("-oServerAliveInterval=15")
-           .arg("-oServerAliveCountMax=3")
-           .arg("-oBatchMode=yes");
+            .arg("-oServerAliveInterval=15")
+            .arg("-oServerAliveCountMax=3")
+            .arg("-oBatchMode=yes");
 
         if port != 22 {
             cmd.arg("-p").arg(port.to_string());
@@ -261,11 +290,14 @@ impl SftpSession {
         let stdin_fd: OwnedFd = child_sock.try_clone()?.into();
         let stdout_fd: OwnedFd = child_sock.into();
         cmd.stdin(Stdio::from(stdin_fd))
-           .stdout(Stdio::from(stdout_fd))
-           .stderr(Stdio::inherit());
+            .stdout(Stdio::from(stdout_fd))
+            .stderr(Stdio::inherit());
 
-        let _child = cmd.spawn().map_err(|e| {
-            SftpError::Io(io::Error::new(io::ErrorKind::Other, format!("ssh spawn: {e}")))
+        let child = cmd.spawn().map_err(|e| {
+            SftpError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("ssh spawn: {e}"),
+            ))
         })?;
 
         let reader = our_sock.try_clone()?;
@@ -275,6 +307,7 @@ impl SftpSession {
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             next_id: AtomicU32::new(1),
+            _child: Mutex::new(Some(child)),
         };
 
         session.sftp_init()?;
@@ -316,7 +349,8 @@ impl SftpSession {
         let mut r = self.reader.lock().unwrap();
 
         let mut lenbuf = [0u8; 4];
-        r.read_exact(&mut lenbuf).map_err(|_| SftpError::Disconnected)?;
+        r.read_exact(&mut lenbuf)
+            .map_err(|_| SftpError::Disconnected)?;
         let len = u32::from_be_bytes(lenbuf) as usize;
 
         if len == 0 || len > 256 * 1024 {
@@ -324,7 +358,8 @@ impl SftpSession {
         }
 
         let mut data = vec![0u8; len];
-        r.read_exact(&mut data).map_err(|_| SftpError::Disconnected)?;
+        r.read_exact(&mut data)
+            .map_err(|_| SftpError::Disconnected)?;
 
         let pkt_type = data[0];
         Ok((pkt_type, data[1..].to_vec()))
@@ -353,7 +388,9 @@ impl SftpSession {
 
     fn check_status(&self, resp_type: u8, data: &[u8]) -> SftpResult<()> {
         if resp_type != SSH_FXP_STATUS {
-            return Err(SftpError::Protocol(format!("expected STATUS, got {resp_type}")));
+            return Err(SftpError::Protocol(format!(
+                "expected STATUS, got {resp_type}"
+            )));
         }
         let mut r = Reader::new(&data[4..]); // skip id
         let code = r.get_u32()?;
@@ -373,7 +410,9 @@ impl SftpSession {
 
         let (ptype, data) = self.recv()?;
         if ptype != SSH_FXP_VERSION {
-            return Err(SftpError::Protocol(format!("expected VERSION, got {ptype}")));
+            return Err(SftpError::Protocol(format!(
+                "expected VERSION, got {ptype}"
+            )));
         }
         let version = u32::from_be_bytes(data[0..4].try_into().unwrap());
         log::info!("SFTP server version: {version}");
@@ -606,13 +645,181 @@ impl SftpSession {
     pub fn open_flags_from_libc(flags: i32) -> u32 {
         let mut sf = 0u32;
         let accmode = flags & libc::O_ACCMODE;
-        if accmode == libc::O_RDONLY { sf |= SSH_FXF_READ; }
-        if accmode == libc::O_WRONLY { sf |= SSH_FXF_WRITE; }
-        if accmode == libc::O_RDWR   { sf |= SSH_FXF_READ | SSH_FXF_WRITE; }
-        if flags & libc::O_CREAT != 0 { sf |= SSH_FXF_CREAT; }
-        if flags & libc::O_TRUNC != 0 { sf |= SSH_FXF_TRUNC; }
-        if flags & libc::O_EXCL  != 0 { sf |= SSH_FXF_EXCL; }
-        if flags & libc::O_APPEND != 0 { sf |= SSH_FXF_APPEND; }
+        if accmode == libc::O_RDONLY {
+            sf |= SSH_FXF_READ;
+        }
+        if accmode == libc::O_WRONLY {
+            sf |= SSH_FXF_WRITE;
+        }
+        if accmode == libc::O_RDWR {
+            sf |= SSH_FXF_READ | SSH_FXF_WRITE;
+        }
+        if flags & libc::O_CREAT != 0 {
+            sf |= SSH_FXF_CREAT;
+        }
+        if flags & libc::O_TRUNC != 0 {
+            sf |= SSH_FXF_TRUNC;
+        }
+        if flags & libc::O_EXCL != 0 {
+            sf |= SSH_FXF_EXCL;
+        }
+        if flags & libc::O_APPEND != 0 {
+            sf |= SSH_FXF_APPEND;
+        }
         sf
+    }
+}
+
+impl Drop for SftpSession {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self._child.lock() {
+            if let Some(ref mut child) = *guard {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buf_put_u32() {
+        let mut buf = Buf::new();
+        buf.put_u32(0x01020304);
+        assert_eq!(buf.0, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn buf_put_str() {
+        let mut buf = Buf::new();
+        buf.put_str("abc");
+        // 4-byte length (3) + 3 bytes "abc"
+        assert_eq!(buf.0, vec![0, 0, 0, 3, b'a', b'b', b'c']);
+    }
+
+    #[test]
+    fn buf_put_bytes() {
+        let mut buf = Buf::new();
+        buf.put_bytes(&[0xDE, 0xAD]);
+        assert_eq!(buf.0, vec![0, 0, 0, 2, 0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn buf_put_attrs() {
+        let attrs = FileAttr {
+            size: 1024,
+            uid: 1000,
+            gid: 1000,
+            perm: 0o100644,
+            atime: 1000000,
+            mtime: 2000000,
+        };
+        let mut buf = Buf::new();
+        buf.put_attrs(&attrs);
+
+        let mut r = Reader::new(&buf.0);
+        let flags = r.get_u32().unwrap();
+        assert_eq!(
+            flags,
+            SSH_FILEXFER_ATTR_SIZE
+                | SSH_FILEXFER_ATTR_UIDGID
+                | SSH_FILEXFER_ATTR_PERMISSIONS
+                | SSH_FILEXFER_ATTR_ACMODTIME
+        );
+        assert_eq!(r.get_u64().unwrap(), 1024);
+        assert_eq!(r.get_u32().unwrap(), 1000); // uid
+        assert_eq!(r.get_u32().unwrap(), 1000); // gid
+        assert_eq!(r.get_u32().unwrap(), 0o100644); // perm
+        assert_eq!(r.get_u32().unwrap(), 1000000); // atime
+        assert_eq!(r.get_u32().unwrap(), 2000000); // mtime
+    }
+
+    #[test]
+    fn reader_get_u32() {
+        let data = [0x00, 0x00, 0x01, 0x00];
+        let mut r = Reader::new(&data);
+        assert_eq!(r.get_u32().unwrap(), 256);
+    }
+
+    #[test]
+    fn reader_get_string() {
+        let mut buf = Buf::new();
+        buf.put_str("hello");
+        let mut r = Reader::new(&buf.0);
+        assert_eq!(r.get_string().unwrap(), "hello");
+    }
+
+    #[test]
+    fn reader_get_attrs_roundtrip() {
+        let original = FileAttr {
+            size: 999,
+            uid: 501,
+            gid: 20,
+            perm: 0o40755,
+            atime: 12345,
+            mtime: 67890,
+        };
+        let mut buf = Buf::new();
+        buf.put_attrs(&original);
+
+        let mut r = Reader::new(&buf.0);
+        let parsed = r.get_attrs().unwrap();
+        assert_eq!(parsed.size, original.size);
+        assert_eq!(parsed.uid, original.uid);
+        assert_eq!(parsed.gid, original.gid);
+        assert_eq!(parsed.perm, original.perm);
+        assert_eq!(parsed.atime, original.atime);
+        assert_eq!(parsed.mtime, original.mtime);
+    }
+
+    #[test]
+    fn reader_underflow() {
+        let data = [0x00, 0x01];
+        let mut r = Reader::new(&data);
+        assert!(r.get_u32().is_err());
+    }
+
+    #[test]
+    fn open_flags_rdonly() {
+        let sf = SftpSession::open_flags_from_libc(libc::O_RDONLY);
+        assert_eq!(sf, SSH_FXF_READ);
+    }
+
+    #[test]
+    fn open_flags_wronly() {
+        let sf = SftpSession::open_flags_from_libc(libc::O_WRONLY);
+        assert_eq!(sf, SSH_FXF_WRITE);
+    }
+
+    #[test]
+    fn open_flags_rdwr() {
+        let sf = SftpSession::open_flags_from_libc(libc::O_RDWR);
+        assert_eq!(sf, SSH_FXF_READ | SSH_FXF_WRITE);
+    }
+
+    #[test]
+    fn open_flags_create_trunc() {
+        let sf = SftpSession::open_flags_from_libc(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC);
+        assert!(sf & SSH_FXF_WRITE != 0);
+        assert!(sf & SSH_FXF_CREAT != 0);
+        assert!(sf & SSH_FXF_TRUNC != 0);
+    }
+
+    #[test]
+    fn open_flags_append() {
+        let sf = SftpSession::open_flags_from_libc(libc::O_WRONLY | libc::O_APPEND);
+        assert!(sf & SSH_FXF_WRITE != 0);
+        assert!(sf & SSH_FXF_APPEND != 0);
+    }
+
+    #[test]
+    fn open_flags_excl() {
+        let sf = SftpSession::open_flags_from_libc(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL);
+        assert!(sf & SSH_FXF_WRITE != 0);
+        assert!(sf & SSH_FXF_CREAT != 0);
+        assert!(sf & SSH_FXF_EXCL != 0);
     }
 }

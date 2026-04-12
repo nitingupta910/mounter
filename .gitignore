@@ -1,5 +1,6 @@
 .build/
 build/
+target/
 .swiftpm/
 *.xcodeproj
 .DS_Store

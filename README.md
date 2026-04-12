@@ -1,59 +1,52 @@
 # mounter
 
-Mount remote Linux directories over SSH so they appear in Finder. No macFUSE, no kernel extensions, no sudo.
+Mount remote SSH directories in macOS Finder. No macFUSE, no sudo.
 
-## How it works
+## Quick start
 
+```bash
+git clone https://github.com/nitingupta910/mounter.git && cd mounter
+
+# Build the macOS CLI
+cd mounter-cli && cargo build --release
+cp target/release/mounter /usr/local/bin/
+
+# Mount (Docker image builds automatically on first run, ~2 min)
+mounter mount server:/home/user
+mounter mount user@server:/data -n mydata
+
+# Browse files at ~/mnt/<name> or open in Finder
+open ~/mnt/server
+
+# Other commands
+mounter list
+mounter status
+mounter unmount server
 ```
-macOS Finder ←[SMB]→ Docker container ←[sshfs]→ remote server
-```
-
-A lightweight Docker container (via [OrbStack](https://orbstack.dev)) runs [sshfs 3.7.5](https://github.com/libfuse/sshfs) built from source. Remote files are exported to macOS over SMB. The macOS SMB client mounts them as a regular user — no sudo needed.
 
 ## Requirements
 
 - macOS with [OrbStack](https://orbstack.dev) (provides Docker)
-- SSH key-based auth to your remote server
+- SSH key auth to your remote server
 
-## Install
+## How it works
 
-```bash
-# Clone and add to PATH
-git clone https://github.com/nitingupta910/mounter.git
-ln -s "$(pwd)/mounter/mounter" /usr/local/bin/mounter
+```
+Finder ←[SMB]→ Docker container ←[sshfs-rs]→ remote server
 ```
 
-The Docker image (~79 MB, Alpine-based) is built automatically on first mount.
+`sshfs-rs` is our Rust reimplementation of sshfs (1,200 lines vs 5,170 in the unmaintained C original). It speaks SFTP v3 over an `ssh` subprocess — your existing keys, config, and agent just work.
 
-## Usage
+A background monitor process auto-recovers stale mounts after sleep/wake or network changes.
 
-```bash
-mounter mount server:/home/user           # mount at ~/mnt/server
-mounter mount user@server:/data -n mydata # custom name → ~/mnt/mydata
-mounter list                              # show active mounts
-mounter status                            # container + sshfs info
-mounter unmount server                    # clean teardown
-```
+## Project structure
 
-Respects `~/.ssh/config` for hostname, user, port, and identity file resolution.
-
-## Resilience
-
-| Scenario | Handling |
-|---|---|
-| Brief disconnect | sshfs `-o reconnect` + `ServerAliveInterval` retries automatically |
-| Long disconnect / sleep | In-container health monitor detects stale mounts and remounts every 30s |
-| Container restart | `--restart unless-stopped` policy; saved mount configs enable auto-remount |
-| macOS SMB reconnect | macOS kernel SMB client reconnects automatically once sshfs is back |
-
-## Architecture
-
-- **Dockerfile**: multi-stage build — sshfs 3.7.5 from git source, Alpine 3.21 runtime (~79 MB)
-- **`mounter`**: bash CLI that orchestrates `docker`, `ssh -G`, `mount_smbfs`
-- **`monitor.sh`**: runs inside the container, health-checks mounts every 30s, auto-remounts stale FUSE mounts
-- **`entrypoint.sh`**: starts Samba + health monitor
-- Hostnames resolved on macOS before passing to the container (handles Tailscale, custom DNS)
+| Directory | What | Target |
+|---|---|---|
+| `mounter-cli/` | macOS CLI + monitor daemon | macOS (native) |
+| `sshfs-rs/` | SFTP/FUSE filesystem | Linux (Docker) |
+| `mounter` | Bash fallback (no Rust needed) | macOS |
 
 ## License
 
-Apache License 2.0
+Apache 2.0

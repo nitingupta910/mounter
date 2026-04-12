@@ -1,0 +1,12 @@
+[package]
+name = "mounter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"  # For fork/signal/kill — POSIX APIs not exposed by std
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"
