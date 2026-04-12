@@ -1,21 +1,20 @@
-# Stage 1: Build sshfs-rs from source
-FROM rust:latest AS builder
+# Stage 1: Build sshfs-rs on Debian Trixie
+FROM debian:trixie-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libfuse3-dev pkg-config && \
+        ca-certificates rustc cargo libfuse3-dev pkg-config libstd-rust-dev && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY sshfs-rs/ .
 RUN cargo build --release && strip target/release/sshfs-rs
 
-# Stage 2: Minimal runtime — sshfs-rs + samba
-FROM alpine:3.21
-RUN apk add --no-cache \
-        fuse3 openssh-client \
-        samba-server samba-common-tools && \
+# Stage 2: Debian Trixie runtime — sshfs-rs + samba
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        fuse3 libfuse3-4 openssh-client samba && \
+    rm -rf /var/lib/apt/lists/* && \
     mkdir -p /root/.ssh /mnt /run/samba /etc/mounter
 COPY --from=builder /src/target/release/sshfs-rs /usr/local/bin/sshfs-rs
 COPY entrypoint.sh /entrypoint.sh
 COPY monitor.sh /monitor.sh
-RUN chmod +x /entrypoint.sh /monitor.sh && \
-    sed -i 's/sshfs /sshfs-rs /g; s/fusermount3/fusermount/g' /monitor.sh
+RUN chmod +x /entrypoint.sh /monitor.sh
 ENTRYPOINT ["/entrypoint.sh"]

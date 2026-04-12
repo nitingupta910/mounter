@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 set -e
 
 mkdir -p /etc/mounter /run/samba
@@ -14,7 +14,7 @@ EOF
 
 smbd --daemon --no-process-group
 
-# Start the health monitor in the background
+# Start health monitor in background
 /monitor.sh &
 
 exec sleep infinity
