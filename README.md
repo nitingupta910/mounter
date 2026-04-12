@@ -8,7 +8,7 @@ Mount remote SSH directories in macOS Finder. No macFUSE, no sudo.
 git clone https://github.com/nitingupta910/mounter.git && cd mounter
 
 # Build the macOS CLI
-cd mounter-cli && cargo build --release
+cd mounter && cargo build --release
 cp target/release/mounter /usr/local/bin/
 
 # Mount (Docker image builds automatically on first run, ~2 min)
@@ -43,7 +43,7 @@ A background monitor process auto-recovers stale mounts after sleep/wake or netw
 
 | Directory | What | Target |
 |---|---|---|
-| `mounter-cli/` | macOS CLI + monitor daemon | macOS (native) |
+| `mounter/` | macOS CLI + monitor daemon | macOS (native) |
 | `sshfs-rs/` | SFTP/FUSE filesystem | Linux (Docker) |
 | `mounter` | Bash fallback (no Rust needed) | macOS |
 
