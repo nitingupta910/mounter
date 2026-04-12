@@ -478,7 +478,9 @@ fn monitor_loop(
             sigterm_handler as *const () as libc::sighandler_t,
         );
     }
-    MONITOR_NAME.lock().unwrap().replace(name.to_string());
+    if let Ok(mut guard) = MONITOR_NAME.lock() {
+        guard.replace(name.to_string());
+    }
 
     let mut consecutive_failures: u32 = 0;
 

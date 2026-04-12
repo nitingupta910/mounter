@@ -40,15 +40,33 @@ fn main() {
         match args[i].as_str() {
             "-p" => {
                 i += 1;
-                port = args
-                    .get(i)
-                    .expect("missing port value after -p")
-                    .parse()
-                    .expect("bad port");
+                let port_str = match args.get(i) {
+                    Some(s) => s,
+                    None => {
+                        eprintln!("missing port value after -p");
+                        std::process::exit(1);
+                    }
+                };
+                port = match port_str.parse() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("invalid port: {port_str}");
+                        std::process::exit(1);
+                    }
+                };
             }
             "-i" => {
                 i += 1;
-                identity = Some(args.get(i).expect("missing path after -i").clone());
+                identity = Some(
+                    match args.get(i) {
+                        Some(s) => s,
+                        None => {
+                            eprintln!("missing path after -i");
+                            std::process::exit(1);
+                        }
+                    }
+                    .clone(),
+                );
             }
             "-f" => {
                 foreground = true;
@@ -59,7 +77,13 @@ fn main() {
                     match opt.trim() {
                         "allow_other" => allow_other = true,
                         o if o.starts_with("port=") => {
-                            port = o[5..].parse().expect("bad port");
+                            port = match o[5..].parse() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    eprintln!("invalid port: {}", &o[5..]);
+                                    std::process::exit(1);
+                                }
+                            };
                         }
                         o if o.starts_with("IdentityFile=") => {
                             identity = Some(o[13..].to_string());
@@ -116,7 +140,10 @@ fn main() {
     }
 
     if foreground {
-        fuser::mount2(filesystem, mountpoint, &options).expect("mount failed");
+        if let Err(e) = fuser::mount2(filesystem, mountpoint, &options) {
+            eprintln!("mount failed: {e}");
+            std::process::exit(1);
+        }
     } else {
         unsafe {
             let pid = libc::fork();
@@ -129,7 +156,10 @@ fn main() {
             } // parent exits
             libc::setsid();
         }
-        fuser::mount2(filesystem, mountpoint, &options).expect("mount failed");
+        if let Err(e) = fuser::mount2(filesystem, mountpoint, &options) {
+            eprintln!("mount failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

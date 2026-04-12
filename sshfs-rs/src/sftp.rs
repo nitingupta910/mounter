@@ -191,7 +191,12 @@ impl<'a> Reader<'a> {
         if self.pos + 4 > self.data.len() {
             return Err(SftpError::Protocol("buffer underflow".into()));
         }
-        let v = u32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        let v = u32::from_be_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]);
         self.pos += 4;
         Ok(v)
     }
@@ -200,7 +205,16 @@ impl<'a> Reader<'a> {
         if self.pos + 8 > self.data.len() {
             return Err(SftpError::Protocol("buffer underflow".into()));
         }
-        let v = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+        let v = u64::from_be_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+            self.data[self.pos + 4],
+            self.data[self.pos + 5],
+            self.data[self.pos + 6],
+            self.data[self.pos + 7],
+        ]);
         self.pos += 8;
         Ok(v)
     }
@@ -328,7 +342,7 @@ impl SftpSession {
         msg.extend_from_slice(&id.to_be_bytes());
         msg.extend_from_slice(payload);
 
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self.writer.lock().map_err(|_| SftpError::Disconnected)?;
         w.write_all(&msg).map_err(|_| SftpError::Disconnected)?;
         w.flush().map_err(|_| SftpError::Disconnected)
     }
@@ -340,13 +354,13 @@ impl SftpSession {
         msg.push(pkt_type);
         msg.extend_from_slice(payload);
 
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self.writer.lock().map_err(|_| SftpError::Disconnected)?;
         w.write_all(&msg).map_err(|_| SftpError::Disconnected)?;
         w.flush().map_err(|_| SftpError::Disconnected)
     }
 
     fn recv(&self) -> SftpResult<(u8, Vec<u8>)> {
-        let mut r = self.reader.lock().unwrap();
+        let mut r = self.reader.lock().map_err(|_| SftpError::Disconnected)?;
 
         let mut lenbuf = [0u8; 4];
         r.read_exact(&mut lenbuf)
@@ -375,7 +389,8 @@ impl SftpSession {
 
         // Verify ID matches (skip for VERSION which has no id)
         if resp_type != SSH_FXP_VERSION && resp_data.len() >= 4 {
-            let resp_id = u32::from_be_bytes(resp_data[0..4].try_into().unwrap());
+            let resp_id =
+                u32::from_be_bytes([resp_data[0], resp_data[1], resp_data[2], resp_data[3]]);
             if resp_id != id {
                 return Err(SftpError::Protocol(format!(
                     "id mismatch: sent {id}, got {resp_id}"
@@ -414,7 +429,7 @@ impl SftpSession {
                 "expected VERSION, got {ptype}"
             )));
         }
-        let version = u32::from_be_bytes(data[0..4].try_into().unwrap());
+        let version = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         log::info!("SFTP server version: {version}");
         Ok(())
     }

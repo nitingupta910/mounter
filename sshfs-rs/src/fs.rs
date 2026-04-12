@@ -121,6 +121,18 @@ fn join_path(parent: &str, name: &str) -> String {
 
 // ── FUSE filesystem ─────────────────────────────────────────────────
 
+macro_rules! lock_or {
+    ($mutex:expr, $reply:expr) => {
+        match $mutex.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                $reply.error(libc::EIO);
+                return;
+            }
+        }
+    };
+}
+
 pub struct SshFilesystem {
     sftp: Arc<SftpSession>,
     inodes: Mutex<InodeTable>,
@@ -141,7 +153,7 @@ impl SshFilesystem {
     fn resolve(&self, ino: u64) -> Option<String> {
         self.inodes
             .lock()
-            .unwrap()
+            .ok()?
             .get_path(ino)
             .map(|s| s.to_string())
     }
@@ -179,7 +191,7 @@ impl Filesystem for SshFilesystem {
 
         match self.sftp.lstat(&child_path) {
             Ok(a) => {
-                let ino = self.inodes.lock().unwrap().get_or_insert(&child_path);
+                let ino = lock_or!(self.inodes, reply).get_or_insert(&child_path);
                 reply.entry(&TTL, &sftp_attr_to_fuse(ino, &a), 0);
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -216,7 +228,7 @@ impl Filesystem for SshFilesystem {
             ("..".into(), FileType::Directory, 1),
         ];
 
-        let mut inodes = self.inodes.lock().unwrap();
+        let mut inodes = lock_or!(self.inodes, reply);
         for entry in &entries {
             let child_path = join_path(&path, &entry.name);
             let child_ino = inodes.get_or_insert(&child_path);
@@ -251,10 +263,7 @@ impl Filesystem for SshFilesystem {
         match self.sftp.open(&path, sf, 0) {
             Ok(handle) => {
                 let fh = self.alloc_fh();
-                self.open_files
-                    .lock()
-                    .unwrap()
-                    .insert(fh, OpenFile { handle });
+                lock_or!(self.open_files, reply).insert(fh, OpenFile { handle });
                 reply.opened(fh, 0);
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -271,7 +280,7 @@ impl Filesystem for SshFilesystem {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Some(of) = self.open_files.lock().unwrap().remove(&fh) {
+        if let Some(of) = lock_or!(self.open_files, reply).remove(&fh) {
             let _ = self.sftp.close(&of.handle);
         }
         reply.ok();
@@ -289,7 +298,7 @@ impl Filesystem for SshFilesystem {
         reply: ReplyData,
     ) {
         let handle = {
-            let files = self.open_files.lock().unwrap();
+            let files = lock_or!(self.open_files, reply);
             match files.get(&fh) {
                 Some(f) => f.handle.clone(),
                 None => {
@@ -317,7 +326,7 @@ impl Filesystem for SshFilesystem {
         reply: ReplyWrite,
     ) {
         let handle = {
-            let files = self.open_files.lock().unwrap();
+            let files = lock_or!(self.open_files, reply);
             match files.get(&fh) {
                 Some(f) => f.handle.clone(),
                 None => {
@@ -355,17 +364,14 @@ impl Filesystem for SshFilesystem {
         let sf = SftpSession::open_flags_from_libc(flags) | crate::sftp::SSH_FXF_CREAT;
         match self.sftp.open(&path, sf, mode) {
             Ok(handle) => {
-                let ino = self.inodes.lock().unwrap().get_or_insert(&path);
+                let ino = lock_or!(self.inodes, reply).get_or_insert(&path);
                 let fh = self.alloc_fh();
-                self.open_files
-                    .lock()
-                    .unwrap()
-                    .insert(fh, OpenFile { handle });
+                lock_or!(self.open_files, reply).insert(fh, OpenFile { handle });
 
                 let attr = self.sftp.lstat(&path).unwrap_or_else(|_| {
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_secs() as u32;
                     FileAttr {
                         size: 0,
@@ -403,7 +409,7 @@ impl Filesystem for SshFilesystem {
         match self.sftp.mkdir(&path, mode) {
             Ok(()) => match self.sftp.lstat(&path) {
                 Ok(a) => {
-                    let ino = self.inodes.lock().unwrap().get_or_insert(&path);
+                    let ino = lock_or!(self.inodes, reply).get_or_insert(&path);
                     reply.entry(&TTL, &sftp_attr_to_fuse(ino, &a), 0);
                 }
                 Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -423,7 +429,7 @@ impl Filesystem for SshFilesystem {
         let path = join_path(&parent_path, &name.to_string_lossy());
         match self.sftp.remove(&path) {
             Ok(()) => {
-                self.inodes.lock().unwrap().remove_path(&path);
+                lock_or!(self.inodes, reply).remove_path(&path);
                 reply.ok();
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -441,7 +447,7 @@ impl Filesystem for SshFilesystem {
         let path = join_path(&parent_path, &name.to_string_lossy());
         match self.sftp.rmdir(&path) {
             Ok(()) => {
-                self.inodes.lock().unwrap().remove_path(&path);
+                lock_or!(self.inodes, reply).remove_path(&path);
                 reply.ok();
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -477,7 +483,7 @@ impl Filesystem for SshFilesystem {
 
         match self.sftp.rename(&old_path, &new_path) {
             Ok(()) => {
-                self.inodes.lock().unwrap().rename(&old_path, &new_path);
+                lock_or!(self.inodes, reply).rename(&old_path, &new_path);
                 reply.ok();
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -535,13 +541,13 @@ impl Filesystem for SshFilesystem {
         let now = || {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs() as u32
         };
         if let Some(t) = atime {
             attrs.atime = match t {
                 TimeOrNow::SpecificTime(t) => {
-                    t.duration_since(UNIX_EPOCH).unwrap().as_secs() as u32
+                    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as u32
                 }
                 TimeOrNow::Now => now(),
             };
@@ -549,7 +555,7 @@ impl Filesystem for SshFilesystem {
         if let Some(t) = mtime {
             attrs.mtime = match t {
                 TimeOrNow::SpecificTime(t) => {
-                    t.duration_since(UNIX_EPOCH).unwrap().as_secs() as u32
+                    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as u32
                 }
                 TimeOrNow::Now => now(),
             };
