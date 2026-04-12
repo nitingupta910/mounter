@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(30);
+const CACHE_TTL: Duration = Duration::from_secs(30);
 const BLOCK_SIZE: u32 = 512;
 
 // ── Inode management ─────────────────────────────────────────────────
@@ -68,6 +69,80 @@ impl InodeTable {
 
 struct OpenFile {
     handle: Vec<u8>, // SFTP server's opaque file handle
+    path: String,    // remote path (for cache invalidation on write)
+}
+
+// ── Attribute cache ─────────────────────────────────────────────────
+// Populated on readdir, consumed by getattr/lookup. Reduces per-directory
+// SFTP round-trips from O(N) to O(1).
+
+struct CachedAttr {
+    attr: FileAttr,
+    expires: Instant,
+}
+
+struct AttrCache {
+    entries: HashMap<String, CachedAttr>,
+}
+
+impl AttrCache {
+    fn new() -> Self {
+        AttrCache {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&self, path: &str) -> Option<&FileAttr> {
+        self.entries.get(path).and_then(|c| {
+            if c.expires > Instant::now() {
+                Some(&c.attr)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn insert(&mut self, path: String, attr: FileAttr) {
+        self.entries.insert(
+            path,
+            CachedAttr {
+                attr,
+                expires: Instant::now() + CACHE_TTL,
+            },
+        );
+    }
+
+    fn invalidate(&mut self, path: &str) {
+        self.entries.remove(path);
+    }
+
+    /// Invalidate a path and its parent (for mutations that change directory mtime).
+    fn invalidate_with_parent(&mut self, path: &str) {
+        self.entries.remove(path);
+        if let Some(parent) = parent_path(path) {
+            self.entries.remove(&parent);
+        }
+    }
+
+    /// Remove expired entries periodically to avoid unbounded growth.
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, v| v.expires > now);
+    }
+}
+
+fn parent_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if let Some(pos) = trimmed.rfind('/') {
+        let parent = &trimmed[..pos];
+        if parent.is_empty() {
+            Some("/".to_string())
+        } else {
+            Some(parent.to_string())
+        }
+    } else {
+        None
+    }
 }
 
 // ── Convert types ────────────────────────────────────────────────────
@@ -137,7 +212,9 @@ pub struct SshFilesystem {
     sftp: Arc<SftpSession>,
     inodes: Mutex<InodeTable>,
     open_files: Mutex<HashMap<u64, OpenFile>>,
+    cache: Mutex<AttrCache>,
     next_fh: AtomicU64,
+    prune_counter: AtomicU64,
 }
 
 impl SshFilesystem {
@@ -146,7 +223,18 @@ impl SshFilesystem {
             sftp,
             inodes: Mutex::new(InodeTable::new(root_path)),
             open_files: Mutex::new(HashMap::new()),
+            cache: Mutex::new(AttrCache::new()),
             next_fh: AtomicU64::new(1),
+            prune_counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Prune expired cache entries every ~100 operations.
+    fn maybe_prune_cache(&self) {
+        if self.prune_counter.fetch_add(1, Ordering::Relaxed) % 100 == 0 {
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.prune();
+            }
         }
     }
 
@@ -165,6 +253,7 @@ impl SshFilesystem {
 
 impl Filesystem for SshFilesystem {
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        self.maybe_prune_cache();
         let path = match self.resolve(ino) {
             Some(p) => p,
             None => {
@@ -172,8 +261,20 @@ impl Filesystem for SshFilesystem {
                 return;
             }
         };
+        // Check cache first
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(a) = cache.get(&path) {
+                reply.attr(&TTL, &sftp_attr_to_fuse(ino, a));
+                return;
+            }
+        }
         match self.sftp.lstat(&path) {
-            Ok(a) => reply.attr(&TTL, &sftp_attr_to_fuse(ino, &a)),
+            Ok(a) => {
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(path, a.clone());
+                }
+                reply.attr(&TTL, &sftp_attr_to_fuse(ino, &a));
+            }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
         }
     }
@@ -189,9 +290,20 @@ impl Filesystem for SshFilesystem {
         let child_name = name.to_string_lossy();
         let child_path = join_path(&parent_path, &child_name);
 
+        // Check cache first
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(a) = cache.get(&child_path) {
+                let ino = lock_or!(self.inodes, reply).get_or_insert(&child_path);
+                reply.entry(&TTL, &sftp_attr_to_fuse(ino, a), 0);
+                return;
+            }
+        }
         match self.sftp.lstat(&child_path) {
             Ok(a) => {
                 let ino = lock_or!(self.inodes, reply).get_or_insert(&child_path);
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(child_path, a.clone());
+                }
                 reply.entry(&TTL, &sftp_attr_to_fuse(ino, &a), 0);
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -228,6 +340,15 @@ impl Filesystem for SshFilesystem {
             ("..".into(), FileType::Directory, 1),
         ];
 
+        // Cache all attrs from this directory listing — this is the key optimization.
+        // Subsequent getattr/lookup calls for these files will hit cache instead of SFTP.
+        if let Ok(mut cache) = self.cache.lock() {
+            for entry in &entries {
+                let child_path = join_path(&path, &entry.name);
+                cache.insert(child_path, entry.attrs.clone());
+            }
+        }
+
         let mut inodes = lock_or!(self.inodes, reply);
         for entry in &entries {
             let child_path = join_path(&path, &entry.name);
@@ -263,7 +384,7 @@ impl Filesystem for SshFilesystem {
         match self.sftp.open(&path, sf, 0) {
             Ok(handle) => {
                 let fh = self.alloc_fh();
-                lock_or!(self.open_files, reply).insert(fh, OpenFile { handle });
+                lock_or!(self.open_files, reply).insert(fh, OpenFile { handle, path });
                 reply.opened(fh, 0);
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -325,10 +446,10 @@ impl Filesystem for SshFilesystem {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let handle = {
+        let (handle, path) = {
             let files = lock_or!(self.open_files, reply);
             match files.get(&fh) {
-                Some(f) => f.handle.clone(),
+                Some(f) => (f.handle.clone(), f.path.clone()),
                 None => {
                     reply.error(EIO);
                     return;
@@ -336,7 +457,13 @@ impl Filesystem for SshFilesystem {
             }
         };
         match self.sftp.write(&handle, offset as u64, data) {
-            Ok(()) => reply.written(data.len() as u32),
+            Ok(()) => {
+                // Invalidate cached attrs since size/mtime changed
+                if let Ok(mut c) = self.cache.lock() {
+                    c.invalidate(&path);
+                }
+                reply.written(data.len() as u32);
+            }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
         }
     }
@@ -366,7 +493,13 @@ impl Filesystem for SshFilesystem {
             Ok(handle) => {
                 let ino = lock_or!(self.inodes, reply).get_or_insert(&path);
                 let fh = self.alloc_fh();
-                lock_or!(self.open_files, reply).insert(fh, OpenFile { handle });
+                lock_or!(self.open_files, reply).insert(
+                    fh,
+                    OpenFile {
+                        handle,
+                        path: path.clone(),
+                    },
+                );
 
                 let attr = self.sftp.lstat(&path).unwrap_or_else(|_| {
                     let now = SystemTime::now()
@@ -382,6 +515,9 @@ impl Filesystem for SshFilesystem {
                         mtime: now,
                     }
                 });
+                if let Ok(mut c) = self.cache.lock() {
+                    c.invalidate_with_parent(&path);
+                }
                 reply.created(&TTL, &sftp_attr_to_fuse(ino, &attr), 0, fh, 0);
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -410,6 +546,9 @@ impl Filesystem for SshFilesystem {
             Ok(()) => match self.sftp.lstat(&path) {
                 Ok(a) => {
                     let ino = lock_or!(self.inodes, reply).get_or_insert(&path);
+                    if let Ok(mut c) = self.cache.lock() {
+                        c.invalidate_with_parent(&path);
+                    }
                     reply.entry(&TTL, &sftp_attr_to_fuse(ino, &a), 0);
                 }
                 Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -430,6 +569,9 @@ impl Filesystem for SshFilesystem {
         match self.sftp.remove(&path) {
             Ok(()) => {
                 lock_or!(self.inodes, reply).remove_path(&path);
+                if let Ok(mut c) = self.cache.lock() {
+                    c.invalidate_with_parent(&path);
+                }
                 reply.ok();
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -448,6 +590,9 @@ impl Filesystem for SshFilesystem {
         match self.sftp.rmdir(&path) {
             Ok(()) => {
                 lock_or!(self.inodes, reply).remove_path(&path);
+                if let Ok(mut c) = self.cache.lock() {
+                    c.invalidate_with_parent(&path);
+                }
                 reply.ok();
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -484,6 +629,10 @@ impl Filesystem for SshFilesystem {
         match self.sftp.rename(&old_path, &new_path) {
             Ok(()) => {
                 lock_or!(self.inodes, reply).rename(&old_path, &new_path);
+                if let Ok(mut c) = self.cache.lock() {
+                    c.invalidate_with_parent(&old_path);
+                    c.invalidate_with_parent(&new_path);
+                }
                 reply.ok();
             }
             Err(e) => reply.error(sftp_err_to_errno(&e)),
@@ -572,6 +721,9 @@ impl Filesystem for SshFilesystem {
             }
         }
 
+        if let Ok(mut c) = self.cache.lock() {
+            c.invalidate(&path);
+        }
         match self.sftp.setstat(&path, &attrs) {
             Ok(()) => reply.attr(&TTL, &sftp_attr_to_fuse(ino, &attrs)),
             Err(_) => {
@@ -735,5 +887,91 @@ mod tests {
         assert_eq!(t.get_path(ino), Some("/new"));
         // Old path should be gone
         assert!(t.path_to_ino.get("/old").is_none());
+    }
+
+    // ── AttrCache tests ────────────────────────────────────────────
+
+    #[test]
+    fn cache_insert_and_get() {
+        let mut cache = AttrCache::new();
+        let attr = FileAttr {
+            size: 42,
+            uid: 0,
+            gid: 0,
+            perm: 0o644,
+            atime: 0,
+            mtime: 0,
+        };
+        cache.insert("/test".to_string(), attr);
+        assert_eq!(cache.get("/test").unwrap().size, 42);
+    }
+
+    #[test]
+    fn cache_miss() {
+        let cache = AttrCache::new();
+        assert!(cache.get("/nonexistent").is_none());
+    }
+
+    #[test]
+    fn cache_invalidate() {
+        let mut cache = AttrCache::new();
+        let attr = FileAttr {
+            size: 1,
+            uid: 0,
+            gid: 0,
+            perm: 0o644,
+            atime: 0,
+            mtime: 0,
+        };
+        cache.insert("/file".to_string(), attr);
+        assert!(cache.get("/file").is_some());
+        cache.invalidate("/file");
+        assert!(cache.get("/file").is_none());
+    }
+
+    #[test]
+    fn cache_invalidate_with_parent() {
+        let mut cache = AttrCache::new();
+        let attr = FileAttr {
+            size: 1,
+            uid: 0,
+            gid: 0,
+            perm: 0o644,
+            atime: 0,
+            mtime: 0,
+        };
+        cache.insert("/dir".to_string(), attr.clone());
+        cache.insert("/dir/file".to_string(), attr);
+        cache.invalidate_with_parent("/dir/file");
+        assert!(cache.get("/dir/file").is_none());
+        assert!(cache.get("/dir").is_none()); // parent invalidated too
+    }
+
+    #[test]
+    fn cache_prune_removes_nothing_when_fresh() {
+        let mut cache = AttrCache::new();
+        let attr = FileAttr {
+            size: 1,
+            uid: 0,
+            gid: 0,
+            perm: 0o644,
+            atime: 0,
+            mtime: 0,
+        };
+        cache.insert("/a".to_string(), attr.clone());
+        cache.insert("/b".to_string(), attr);
+        cache.prune();
+        assert!(cache.get("/a").is_some());
+        assert!(cache.get("/b").is_some());
+    }
+
+    #[test]
+    fn parent_path_works() {
+        assert_eq!(
+            parent_path("/home/user/file"),
+            Some("/home/user".to_string())
+        );
+        assert_eq!(parent_path("/file"), Some("/".to_string()));
+        assert_eq!(parent_path("file"), None);
     }
 }
