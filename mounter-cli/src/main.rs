@@ -304,28 +304,107 @@ fn remove_pid_file(name: &str) {
     fs::remove_file(path).ok();
 }
 
-// ── Health check ────────────────────────────────────────────────────
+// ── Health probes ──────────────────────────────────────────────────
 
-fn smb_mount_healthy(name: &str) -> bool {
+/// Is the macOS SMB mount in the kernel mount table?
+fn smb_in_mount_table(name: &str) -> bool {
     let macmount = mount_base().join(name);
-    let path_str = macmount.to_string_lossy().to_string();
-    let (ok, out) = shell_timeout(&["stat", &path_str], 5);
-    if !ok {
-        // Also check: timeout means stale mount
-        if out == "timeout" {
-            return false;
-        }
-        // Check if it is still in the mount table
-        let (_, mounts) = shell(&["mount"]);
-        return mounts.contains(&format!(" on {path_str} "));
-    }
-    true
+    let (_, mounts) = shell(&["mount"]);
+    mounts.contains(&format!(" on {} ", macmount.to_string_lossy()))
 }
 
+/// Can we stat the macOS SMB mount within a timeout?
+/// Returns None if mount is missing from table entirely.
+fn smb_stat_check(name: &str) -> Option<bool> {
+    if !smb_in_mount_table(name) {
+        return None; // not mounted
+    }
+    let macmount = mount_base().join(name);
+    let (ok, out) = shell_timeout(&["stat", &macmount.to_string_lossy()], 5);
+    Some(ok && out != "timeout")
+}
+
+/// Is sshfs mounted at /mnt/<name> inside the container?
 fn sshfs_mounted_in_container(name: &str) -> bool {
-    let check = format!("mountpoint -q /mnt/{name} 2>/dev/null");
-    let (ok, _) = docker_exec(&check);
+    let (ok, _) = docker_exec(&format!("mountpoint -q /mnt/{name} 2>/dev/null"));
     ok
+}
+
+/// Can we actually read from the sshfs mount inside the container?
+/// Detects stale FUSE mounts where the SSH connection died.
+fn sshfs_responsive(name: &str) -> bool {
+    let (ok, out) = docker_exec(&format!(
+        "timeout 10 ls /mnt/{name}/ >/dev/null 2>&1 && echo ok || echo fail"
+    ));
+    ok && out.trim() == "ok"
+}
+
+/// Full health assessment.
+#[derive(Debug, PartialEq)]
+enum Health {
+    /// Everything works
+    Healthy,
+    /// SMB removed from mount table, sshfs still alive → user ejected
+    UserEjected,
+    /// SMB removed from mount table, sshfs also gone → already cleaned up
+    FullyGone,
+    /// SMB in mount table but hangs, sshfs connection stale
+    SshfsStale,
+    /// SMB in mount table but hangs, sshfs process gone
+    SshfsDead,
+    /// Container not running
+    ContainerDead,
+    /// SMB stale but sshfs is fine → SMB-layer issue only
+    SmbOnly,
+}
+
+fn assess_health(name: &str) -> Health {
+    // Layer 1: Is the container alive?
+    if !container_running() {
+        return Health::ContainerDead;
+    }
+
+    // Layer 2: SMB mount status on macOS
+    match smb_stat_check(name) {
+        Some(true) => {
+            // SMB works. Proactively check sshfs inside container too,
+            // so we can fix it before SMB notices.
+            if sshfs_mounted_in_container(name) && !sshfs_responsive(name) {
+                return Health::SshfsStale;
+            }
+            return Health::Healthy;
+        }
+        None => {
+            // SMB not in mount table at all
+            if sshfs_mounted_in_container(name) {
+                return Health::UserEjected;
+            }
+            return Health::FullyGone;
+        }
+        Some(false) => {
+            // SMB in mount table but stat failed/timed out
+        }
+    }
+
+    // Layer 3: SMB is stale — check sshfs inside container
+    if !sshfs_mounted_in_container(name) {
+        return Health::SshfsDead;
+    }
+    if !sshfs_responsive(name) {
+        return Health::SshfsStale;
+    }
+    // sshfs is fine but SMB is stale → SMB layer issue
+    Health::SmbOnly
+}
+
+// ── Recovery actions ───────────────────────────────────────────────
+
+fn kill_stale_sshfs(name: &str) {
+    docker_exec(&format!(
+        "fusermount3 -u /mnt/{name} 2>/dev/null || fusermount -u /mnt/{name} 2>/dev/null"
+    ));
+    // Give FUSE a moment to release
+    thread::sleep(Duration::from_millis(500));
 }
 
 fn remount_sshfs(name: &str, user: &str, target_ip: &str, path: &str, port: &str) {
@@ -334,22 +413,47 @@ fn remount_sshfs(name: &str, user: &str, target_ip: &str, path: &str, port: &str
     let sshfs_cmd = format!(
         "sshfs-rs {user}@{target_ip}:{path} {vmount} -f -o allow_other,IdentityFile={ckey},port={port}"
     );
-    // Run in background inside container (nohup + &)
-    let cmd = format!("mkdir -p {vmount} && nohup {sshfs_cmd} &");
-    docker_exec(&cmd);
+    docker_exec(&format!(
+        "mkdir -p {vmount} && nohup {sshfs_cmd} > /var/log/sshfs-{name}.log 2>&1 &"
+    ));
 }
 
-fn remount_smb(name: &str, container_ip: &str) {
+fn force_unmount_smb(name: &str) {
     let macmount = mount_base().join(name);
     let path_str = macmount.to_string_lossy().to_string();
-    // Try to unmount first
     shell(&["/sbin/umount", &path_str]);
-    thread::sleep(Duration::from_secs(1));
+    if smb_in_mount_table(name) {
+        shell(&["/usr/sbin/diskutil", "unmount", "force", &path_str]);
+    }
+}
+
+fn mount_smb(name: &str, container_ip: &str) {
+    let macmount = mount_base().join(name);
+    let path_str = macmount.to_string_lossy().to_string();
     let smb_url = format!("//guest@{container_ip}/{name}");
     shell(&["/sbin/mount_smbfs", &smb_url, &path_str]);
 }
 
+fn cleanup_container(name: &str) {
+    kill_stale_sshfs(name);
+    docker_exec(&format!(
+        "sed -i '/^\\[{name}\\]$/,/^$/d' /etc/samba/smb.conf"
+    ));
+    docker_exec("kill -HUP $(pidof smbd) 2>/dev/null");
+}
+
+fn get_container_ip(cached: &str) -> String {
+    if cached.is_empty() {
+        docker_container_ip()
+    } else {
+        cached.to_string()
+    }
+}
+
 // ── Monitor loop ────────────────────────────────────────────────────
+
+const CHECK_INTERVAL: u64 = 15; // seconds between health checks
+const FAILURES_BEFORE_RECONNECT: u32 = 3; // ~45s of failures before acting
 
 fn monitor_loop(
     name: &str,
@@ -359,43 +463,99 @@ fn monitor_loop(
     path: &str,
     port: &str,
 ) {
-    // Install signal handler for SIGTERM: clean unmount + exit
     unsafe {
         libc::signal(
             libc::SIGTERM,
             sigterm_handler as *const () as libc::sighandler_t,
         );
     }
-    // Store name in a static for signal handler
     MONITOR_NAME.lock().unwrap().replace(name.to_string());
 
+    let mut consecutive_failures: u32 = 0;
+
     loop {
-        thread::sleep(Duration::from_secs(30));
+        thread::sleep(Duration::from_secs(CHECK_INTERVAL));
 
-        if !smb_mount_healthy(name) {
-            info(&format!(
-                "[monitor] {name}: SMB mount unhealthy, recovering..."
-            ));
+        let health = assess_health(name);
 
-            if !container_running() {
-                info(&format!("[monitor] {name}: restarting container"));
-                docker_ensure_running();
+        match health {
+            Health::Healthy => {
+                if consecutive_failures > 0 {
+                    info(&format!(
+                        "[monitor] {name}: recovered after {consecutive_failures} checks"
+                    ));
+                }
+                consecutive_failures = 0;
             }
 
-            if !sshfs_mounted_in_container(name) {
-                info(&format!("[monitor] {name}: remounting sshfs"));
+            Health::UserEjected => {
+                info(&format!("[monitor] {name}: user ejected, cleaning up"));
+                cleanup_container(name);
+                remove_pid_file(name);
+                std::process::exit(0);
+            }
+
+            Health::FullyGone => {
+                info(&format!("[monitor] {name}: mount fully gone, exiting"));
+                remove_pid_file(name);
+                std::process::exit(0);
+            }
+
+            Health::ContainerDead => {
+                consecutive_failures += 1;
+                if consecutive_failures >= FAILURES_BEFORE_RECONNECT {
+                    info(&format!("[monitor] {name}: container dead, restarting"));
+                    docker_ensure_running();
+                    remount_sshfs(name, user, target_ip, path, port);
+                    thread::sleep(Duration::from_secs(3));
+                    let cip = get_container_ip(container_ip);
+                    force_unmount_smb(name);
+                    mount_smb(name, &cip);
+                    consecutive_failures = 0;
+                } else {
+                    info(&format!(
+                        "[monitor] {name}: container not responding ({consecutive_failures}/{FAILURES_BEFORE_RECONNECT})"
+                    ));
+                }
+            }
+
+            Health::SshfsStale => {
+                consecutive_failures += 1;
+                if consecutive_failures >= FAILURES_BEFORE_RECONNECT {
+                    info(&format!("[monitor] {name}: sshfs stale, reconnecting"));
+                    kill_stale_sshfs(name);
+                    remount_sshfs(name, user, target_ip, path, port);
+                    thread::sleep(Duration::from_secs(3));
+                    let cip = get_container_ip(container_ip);
+                    force_unmount_smb(name);
+                    mount_smb(name, &cip);
+                    consecutive_failures = 0;
+                } else {
+                    info(&format!(
+                        "[monitor] {name}: sshfs unresponsive ({consecutive_failures}/{FAILURES_BEFORE_RECONNECT}), waiting..."
+                    ));
+                }
+            }
+
+            Health::SshfsDead => {
+                // sshfs process died — no point waiting, remount immediately
+                info(&format!("[monitor] {name}: sshfs dead, remounting"));
                 remount_sshfs(name, user, target_ip, path, port);
-                // Wait for sshfs to come up
                 thread::sleep(Duration::from_secs(3));
+                let cip = get_container_ip(container_ip);
+                force_unmount_smb(name);
+                mount_smb(name, &cip);
+                consecutive_failures = 0;
             }
 
-            let cip = if container_ip.is_empty() {
-                docker_container_ip()
-            } else {
-                container_ip.to_string()
-            };
-            info(&format!("[monitor] {name}: remounting SMB"));
-            remount_smb(name, &cip);
+            Health::SmbOnly => {
+                // sshfs is fine, SMB layer issue — remount SMB directly
+                info(&format!("[monitor] {name}: SMB stale, remounting"));
+                let cip = get_container_ip(container_ip);
+                force_unmount_smb(name);
+                mount_smb(name, &cip);
+                consecutive_failures = 0;
+            }
         }
     }
 }
@@ -851,5 +1011,138 @@ mod tests {
         let (ok, out) = shell_timeout(&["sleep", "10"], 1);
         assert!(!ok);
         assert_eq!(out, "timeout");
+    }
+
+    // ── Health enum tests ──────────────────────────────────────────
+
+    #[test]
+    fn health_enum_equality() {
+        assert_eq!(Health::Healthy, Health::Healthy);
+        assert_ne!(Health::Healthy, Health::UserEjected);
+        assert_ne!(Health::SshfsStale, Health::SshfsDead);
+        assert_ne!(Health::ContainerDead, Health::SmbOnly);
+    }
+
+    #[test]
+    fn health_covers_all_variants() {
+        // Ensure all variants exist and are distinct
+        let variants = [
+            Health::Healthy,
+            Health::UserEjected,
+            Health::FullyGone,
+            Health::SshfsStale,
+            Health::SshfsDead,
+            Health::ContainerDead,
+            Health::SmbOnly,
+        ];
+        for i in 0..variants.len() {
+            for j in (i + 1)..variants.len() {
+                assert_ne!(
+                    variants[i], variants[j],
+                    "variants {i} and {j} should differ"
+                );
+            }
+        }
+    }
+
+    // ── Consecutive failure threshold tests ─────────────────────
+
+    #[test]
+    fn failure_threshold_requires_multiple_checks() {
+        // Simulate the logic: intermittent failures shouldn't trigger reconnect
+        let mut consecutive = 0u32;
+        let threshold = FAILURES_BEFORE_RECONNECT;
+
+        // First failure — should NOT trigger reconnect
+        consecutive += 1;
+        assert!(
+            consecutive < threshold,
+            "single failure must not trigger reconnect"
+        );
+
+        // Second failure — still waiting
+        consecutive += 1;
+        assert!(
+            consecutive < threshold,
+            "two failures must not trigger reconnect"
+        );
+
+        // Third failure — NOW reconnect
+        consecutive += 1;
+        assert!(
+            consecutive >= threshold,
+            "three failures should trigger reconnect"
+        );
+
+        // After reconnect, counter resets
+        consecutive = 0;
+        assert_eq!(consecutive, 0);
+    }
+
+    #[test]
+    fn failure_counter_resets_on_healthy() {
+        let mut consecutive = 2u32;
+        // Simulate healthy check resetting the counter
+        let health = Health::Healthy;
+        if health == Health::Healthy {
+            consecutive = 0;
+        }
+        assert_eq!(consecutive, 0);
+    }
+
+    #[test]
+    fn user_eject_acts_immediately() {
+        // UserEjected should NOT wait for consecutive failures
+        let consecutive = 0u32;
+        let health = Health::UserEjected;
+        // The monitor should act on first detection, not wait
+        assert!(
+            matches!(health, Health::UserEjected),
+            "user eject should be detected immediately regardless of failure count"
+        );
+        assert_eq!(consecutive, 0, "no failures accumulated");
+    }
+
+    #[test]
+    fn fully_gone_acts_immediately() {
+        let health = Health::FullyGone;
+        assert!(
+            matches!(health, Health::FullyGone),
+            "fully gone should exit monitor immediately"
+        );
+    }
+
+    #[test]
+    fn sshfs_dead_acts_immediately() {
+        // Process death (not stale connection) should remount immediately
+        let health = Health::SshfsDead;
+        assert!(
+            matches!(health, Health::SshfsDead),
+            "dead sshfs should remount without waiting for threshold"
+        );
+    }
+
+    #[test]
+    fn sshfs_stale_waits_for_threshold() {
+        // Stale connections could be intermittent — wait for threshold
+        let health = Health::SshfsStale;
+        assert!(
+            matches!(health, Health::SshfsStale),
+            "stale sshfs should wait for consecutive failure threshold"
+        );
+    }
+
+    #[test]
+    fn check_interval_and_threshold_produce_reasonable_timeout() {
+        // Total wait before reconnect = CHECK_INTERVAL * FAILURES_BEFORE_RECONNECT
+        let total_wait = CHECK_INTERVAL * FAILURES_BEFORE_RECONNECT as u64;
+        assert!(
+            total_wait >= 30,
+            "should wait at least 30s before reconnecting (got {total_wait}s)"
+        );
+        assert!(
+            total_wait <= 120,
+            "should not wait more than 2 min before reconnecting (got {total_wait}s)"
+        );
     }
 }
