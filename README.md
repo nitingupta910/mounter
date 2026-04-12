@@ -35,17 +35,18 @@ mounter unmount server
 Finder ←[SMB]→ Docker container ←[sshfs-rs]→ remote server
 ```
 
-`sshfs-rs` is our Rust reimplementation of sshfs (1,200 lines vs 5,170 in the unmaintained C original). It speaks SFTP v3 over an `ssh` subprocess — your existing keys, config, and agent just work.
+`sshfs-rs` is a Rust reimplementation of sshfs (~1,800 lines replacing 5,170 lines of unmaintained C). It speaks SFTP v3 over an `ssh` subprocess — existing keys, config, and agent just work.
 
-A background monitor process auto-recovers stale mounts after sleep/wake or network changes.
+A background monitor auto-recovers mounts after sleep/wake or network changes using a layered health-check state machine with consecutive-failure gating to tolerate brief network blips.
 
 ## Project structure
 
-| Directory | What | Target |
+| Path | What | Target |
 |---|---|---|
-| `mounter/` | macOS CLI + monitor daemon | macOS (native) |
-| `sshfs-rs/` | SFTP/FUSE filesystem | Linux (Docker) |
-| `mounter` | Bash fallback (no Rust needed) | macOS |
+| `mounter/` | Rust CLI + background health monitor | macOS (native) |
+| `sshfs-rs/` | Rust SFTP/FUSE filesystem | Linux (Docker) |
+| `mounter.sh` | Bash fallback (no build needed) | macOS |
+| `Dockerfile.sshfs-rs` | Multi-stage: builds sshfs-rs + Alpine + samba | Linux |
 
 ## License
 
