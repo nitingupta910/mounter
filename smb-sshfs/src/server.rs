@@ -437,13 +437,16 @@ impl SmbSession {
             return;
         }
 
-        let _desired_access = read_u32_le(body, 4);
-        let file_attributes = read_u32_le(body, 8);
-        let _share_access = read_u32_le(body, 12);
-        let create_disposition = read_u32_le(body, 16);
-        let create_options = read_u32_le(body, 20);
-        let name_offset = read_u16_le(body, 24) as usize;
-        let name_length = read_u16_le(body, 26) as usize;
+        // MS-SMB2 2.2.13 CREATE Request body layout:
+        // 0-1: StructureSize=57, 2: SecurityFlags, 3: OplockLevel
+        // 4-7: ImpersonationLevel, 8-15: SmbCreateFlags, 16-23: Reserved
+        let _desired_access = read_u32_le(body, 24);
+        let _file_attributes = read_u32_le(body, 28);
+        let _share_access = read_u32_le(body, 32);
+        let create_disposition = read_u32_le(body, 36);
+        let create_options = read_u32_le(body, 40);
+        let name_offset = read_u16_le(body, 44) as usize;
+        let name_length = read_u16_le(body, 46) as usize;
 
         // Extract filename (UTF-16LE, offset from start of SMB2 header)
         let name_start = name_offset.saturating_sub(SMB2_HEADER_SIZE);
@@ -459,8 +462,9 @@ impl SmbSession {
         log::debug!("CREATE: path={path} disposition={create_disposition} dir={want_dir}");
 
         // Handle create dispositions
+        // FILE_SUPERSEDE (0) is treated as FILE_OPEN for existing files (macOS uses it for share root)
         match create_disposition {
-            FILE_OPEN | FILE_OPEN_IF => {
+            FILE_SUPERSEDE | FILE_OPEN | FILE_OPEN_IF => {
                 match self.stat_cached(&path) {
                     Ok((attr, is_dir)) => {
                         self.respond_create_success(hdr, &path, &attr, is_dir, out);
