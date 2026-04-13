@@ -612,7 +612,7 @@ impl SmbSession {
         let mut full_hdr = hdr.clone();
         full_hdr.tree_id = self.tree_id;
         full_hdr.write_response(STATUS_SUCCESS, &resp, out);
-        log::info!("Tree connected: share={}", self.share_name);
+        log::debug!("Tree connected: share={}", self.share_name);
     }
 
     // ── TREE_DISCONNECT ─────────────────────────────────────────────
