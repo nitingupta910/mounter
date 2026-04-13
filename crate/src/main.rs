@@ -31,7 +31,76 @@ fn usage() -> ! {
     eprintln!("  -i IDENTITY     SSH identity file");
     eprintln!("  -n NAME         Share name (default: host)");
     eprintln!("  --smb-port PORT Local SMB port (default: auto)");
+    eprintln!("  -f, --foreground  Run in foreground (default: daemonize after mount)");
     process::exit(1);
+}
+
+const DAEMON_MARKER_ENV: &str = "_MOUNTER_DAEMONIZED";
+
+/// Re-exec self as a detached daemon with output redirected to a log file.
+/// Polls the log file for the "Mounted at" message, then exits.
+fn spawn_daemon(args: &[String]) -> ! {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let log_path = format!("/tmp/mounter-{}.log", std::process::id());
+    let log_file = match std::fs::File::create(&log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create log file: {e}");
+            process::exit(1);
+        }
+    };
+    let log_err = log_file.try_clone().unwrap();
+
+    let exe = env::current_exe().unwrap_or_else(|_| args[0].clone().into());
+    let mut cmd = process::Command::new(exe);
+    cmd.args(&args[1..]);
+    cmd.env(DAEMON_MARKER_ENV, "1");
+    cmd.stdin(process::Stdio::null());
+    cmd.stdout(log_file);
+    cmd.stderr(log_err);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to start daemon: {e}");
+            process::exit(1);
+        }
+    };
+
+    // Poll log file for mount success or failure
+    let start = Instant::now();
+    let timeout = Duration::from_secs(30);
+    loop {
+        // Check if child died prematurely
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut content = String::new();
+            let _ = std::fs::File::open(&log_path).and_then(|mut f| f.read_to_string(&mut content));
+            eprint!("{content}");
+            eprintln!("mounter daemon exited early: {status}");
+            process::exit(1);
+        }
+
+        let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if content.contains("Mounted at") {
+            // Relay log output up to this point, then detach
+            print!("{content}");
+            println!("(mounter running in background — unmount with `mounter unmount`)");
+            process::exit(0);
+        }
+        if content.contains("Mount failed") || content.contains("SSH connection failed") {
+            eprint!("{content}");
+            let _ = child.kill();
+            process::exit(1);
+        }
+        if start.elapsed() > timeout {
+            eprintln!("Timeout waiting for mount. Log: {log_path}");
+            let _ = child.kill();
+            process::exit(1);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn main() {
@@ -39,9 +108,23 @@ fn main() {
         .format_timestamp_secs()
         .init();
 
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
+    let raw_args: Vec<String> = env::args().collect();
+    if raw_args.len() < 2 {
         usage();
+    }
+
+    // Extract -f/--foreground flag out of args so subsequent parsing is unaffected
+    let foreground = raw_args.iter().any(|a| a == "-f" || a == "--foreground");
+    let args: Vec<String> = raw_args
+        .iter()
+        .filter(|a| a.as_str() != "-f" && a.as_str() != "--foreground")
+        .cloned()
+        .collect();
+    let is_daemon_child = env::var(DAEMON_MARKER_ENV).is_ok();
+
+    // Daemonize the "mount" subcommand by default unless -f is given
+    if args.len() >= 2 && args[1] == "mount" && !foreground && !is_daemon_child {
+        spawn_daemon(&raw_args);
     }
 
     // Subcommands
