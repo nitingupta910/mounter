@@ -19,7 +19,10 @@ use std::sync::Arc;
 fn usage() -> ! {
     eprintln!("smb-sshfs — mount remote SSH directories in Finder");
     eprintln!();
-    eprintln!("Usage: smb-sshfs [user@]host:[path] [options]");
+    eprintln!("Usage:");
+    eprintln!("  smb-sshfs [user@]host:[path] [options]   Start SMB server");
+    eprintln!("  smb-sshfs unmount <name|path|all>        Unmount cleanly");
+    eprintln!("  smb-sshfs list                           Show active mounts");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -p PORT         SSH port (default: 22)");
@@ -40,6 +43,23 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         usage();
+    }
+
+    // Subcommands
+    match args[1].as_str() {
+        "unmount" | "umount" => {
+            let target = args.get(2).map(|s| s.as_str()).unwrap_or_else(|| {
+                eprintln!("Usage: smb-sshfs unmount <name|path|all>");
+                process::exit(1);
+            });
+            process::exit(cmd_unmount(target));
+        }
+        "list" | "ls" => {
+            cmd_list();
+            process::exit(0);
+        }
+        "-h" | "--help" | "help" => usage(),
+        _ => {}
     }
 
     let remote = &args[1];
@@ -273,6 +293,196 @@ fn main() {
             }
             Err(e) => log::warn!("Accept error: {e}"),
         }
+    }
+}
+
+// ── Subcommands ─────────────────────────────────────────────────────
+
+use std::process::Command;
+
+/// An active smb-sshfs mount parsed from `mount` output.
+struct MountInfo {
+    share: String,  // e.g. "myserver"
+    port: u16,      // localhost port
+    path: String,   // mount point, e.g. /Users/x/mnt/myserver
+    source: String, // full source, e.g. //guest:@localhost:44445/myserver
+}
+
+/// Parse `mount` output to find our SMB mounts (guest@localhost).
+fn find_smb_mounts() -> Vec<MountInfo> {
+    let output = match Command::new("mount").output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return vec![],
+    };
+    let mut mounts = Vec::new();
+    for line in output.lines() {
+        // Format: //guest:@localhost:44445/name on /Users/x/mnt/name (smbfs, ...)
+        if !line.contains("smbfs") || !line.contains("localhost") {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(4, ' ').collect();
+        if parts.len() < 4 || parts[1] != "on" {
+            continue;
+        }
+        let source = parts[0];
+        let path = parts[2];
+        // Parse source: //guest:@localhost:PORT/SHARE
+        if let Some(rest) = source.strip_prefix("//") {
+            // rest = "guest:@localhost:44445/myserver"
+            if let Some(host_start) = rest.find("localhost:") {
+                let after_host = &rest[host_start + "localhost:".len()..];
+                // after_host = "44445/myserver"
+                if let Some(slash) = after_host.find('/') {
+                    let port: u16 = after_host[..slash].parse().unwrap_or(0);
+                    let share = &after_host[slash + 1..];
+                    if port > 0 {
+                        mounts.push(MountInfo {
+                            share: share.to_string(),
+                            port,
+                            path: path.to_string(),
+                            source: source.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    mounts
+}
+
+/// Kill the smb-sshfs process listening on the given port.
+fn kill_server(port: u16) -> bool {
+    let output = match Command::new("lsof")
+        .args(["-ti", &format!(":{port}")])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let pids = String::from_utf8_lossy(&output.stdout);
+    let mut killed = false;
+    for pid_str in pids.split_whitespace() {
+        if let Ok(pid) = pid_str.parse::<u32>() {
+            // Verify it's actually smb-sshfs before killing
+            if let Ok(ps) = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "comm="])
+                .output()
+            {
+                let comm = String::from_utf8_lossy(&ps.stdout);
+                if comm.trim().contains("smb-sshfs") {
+                    let _ = Command::new("kill").arg(pid.to_string()).status();
+                    eprintln!("  killed server pid {pid}");
+                    killed = true;
+                }
+            }
+        }
+    }
+    killed
+}
+
+/// Unmount a single mount with escalating force.
+fn unmount_one(info: &MountInfo) -> bool {
+    eprintln!("Unmounting {} ({})", info.share, info.path);
+
+    // Strategy 1: normal umount
+    if Command::new("umount")
+        .arg(&info.path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("  unmounted");
+        kill_server(info.port);
+        return true;
+    }
+
+    // Strategy 2: diskutil unmount
+    if Command::new("diskutil")
+        .args(["unmount", &info.path])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("  unmounted (diskutil)");
+        kill_server(info.port);
+        return true;
+    }
+
+    // Strategy 3: kill the server first, then force unmount.
+    // Killing the server drops the TCP connection, which makes macOS
+    // release the mount more willingly.
+    eprintln!("  mount busy — killing server and force-unmounting");
+    kill_server(info.port);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    if Command::new("diskutil")
+        .args(["unmount", "force", &info.path])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("  force-unmounted");
+        return true;
+    }
+
+    eprintln!("  failed to unmount {}", info.path);
+    false
+}
+
+fn cmd_unmount(target: &str) -> i32 {
+    let mounts = find_smb_mounts();
+    if mounts.is_empty() {
+        eprintln!("No active smb-sshfs mounts found.");
+        return 1;
+    }
+
+    if target == "all" {
+        let mut failures = 0;
+        for m in &mounts {
+            if !unmount_one(m) {
+                failures += 1;
+            }
+        }
+        return if failures > 0 { 1 } else { 0 };
+    }
+
+    // Match by share name or mount path
+    let matched: Vec<&MountInfo> = mounts
+        .iter()
+        .filter(|m| {
+            m.share == target || m.path == target || m.path.ends_with(&format!("/{target}"))
+        })
+        .collect();
+
+    if matched.is_empty() {
+        eprintln!("No mount matching '{target}'. Active mounts:");
+        for m in &mounts {
+            eprintln!("  {} → {}", m.share, m.path);
+        }
+        return 1;
+    }
+
+    let mut failures = 0;
+    for m in matched {
+        if !unmount_one(m) {
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn cmd_list() {
+    let mounts = find_smb_mounts();
+    if mounts.is_empty() {
+        println!("No active smb-sshfs mounts.");
+        return;
+    }
+    for m in &mounts {
+        println!("{:<20} {} (port {})", m.share, m.path, m.port);
     }
 }
 
