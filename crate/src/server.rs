@@ -972,7 +972,6 @@ impl SmbSession {
         resp.extend_from_slice(&(data.len() as u32).to_le_bytes()); // DataLength
         resp.extend_from_slice(&0u32.to_le_bytes()); // DataRemaining
         resp.extend_from_slice(&0u32.to_le_bytes()); // Reserved2
-        resp.push(0); // Padding
         resp.extend_from_slice(data);
         hdr.write_response(STATUS_SUCCESS, &resp, out);
     }
