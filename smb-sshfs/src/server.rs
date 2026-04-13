@@ -13,6 +13,41 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 // ── macOS noise filter ──────────────────────────────────────────────
 // Files that macOS queries for every directory but never exist on Linux.
 
+/// Match an SMB search pattern against a filename.
+/// Supports '*' (any chars), '?' (single char), and literal matches.
+fn smb_pattern_match(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    // Case-insensitive comparison for exact match (SMB is case-insensitive)
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return pattern.eq_ignore_ascii_case(name);
+    }
+    // Simple wildcard matching
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    wildcard_match(&p, &n, 0, 0)
+}
+
+fn wildcard_match(p: &[char], n: &[char], pi: usize, ni: usize) -> bool {
+    if pi == p.len() {
+        return ni == n.len();
+    }
+    if p[pi] == '*' {
+        // '*' matches zero or more characters
+        for skip in 0..=(n.len() - ni) {
+            if wildcard_match(p, n, pi + 1, ni + skip) {
+                return true;
+            }
+        }
+        false
+    } else if ni < n.len() && (p[pi] == '?' || p[pi].to_ascii_lowercase() == n[ni].to_ascii_lowercase()) {
+        wildcard_match(p, n, pi + 1, ni + 1)
+    } else {
+        false
+    }
+}
+
 fn is_apple_metadata(name: &str) -> bool {
     name == ".DS_Store"
         || name == ".localized"
@@ -631,7 +666,7 @@ impl SmbSession {
         resp.extend_from_slice(&0u32.to_le_bytes()); // CreateContextsLength
         resp.push(0); // 1-byte variable part padding (StructureSize=89 means 88 fixed + 1)
 
-        log::debug!("CREATE response ({} bytes):{}", resp.len(), hex_dump(&resp, 128));
+        log::debug!("CREATE OK: path={path} is_dir={is_dir} file_attrs=0x{file_attrs:08x} size={} handle={handle_id}", attr.size);
         hdr.write_response(STATUS_SUCCESS, &resp, out);
     }
 
@@ -787,7 +822,21 @@ impl SmbSession {
         let flags = body[3];
         let fid = self.resolve_fid(read_u64_le(body, 8));
         let restart = flags & 0x01 != 0; // RESTART_SCANS
-        log::info!("QUERY_DIRECTORY: info_level={info_level} flags=0x{flags:02x} fid={fid} restart={restart}");
+
+        // Parse search pattern (MS-SMB2 2.2.33)
+        let name_offset = if body.len() >= 26 { read_u16_le(body, 24) as usize } else { 0 };
+        let name_length = if body.len() >= 28 { read_u16_le(body, 26) as usize } else { 0 };
+        let pattern = if name_length > 0 {
+            let name_start = name_offset.saturating_sub(SMB2_HEADER_SIZE);
+            if name_start + name_length <= body.len() {
+                from_utf16le(&body[name_start..name_start + name_length])
+            } else {
+                "*".to_string()
+            }
+        } else {
+            "*".to_string()
+        };
+        log::info!("QUERY_DIRECTORY: info_level={info_level} flags=0x{flags:02x} fid={fid} restart={restart} pattern=\"{pattern}\"");
 
         let handle = match self.handles.get_mut(&fid) {
             Some(h) if h.is_dir => h,
@@ -821,8 +870,25 @@ impl SmbSession {
             }
         };
 
-        if handle.dir_offset >= entries.len() {
-            self.error_response(hdr, STATUS_NO_MORE_FILES, out);
+        // Filter entries by search pattern
+        let is_wildcard = pattern == "*";
+        let filtered: Vec<&DirEntry> = if is_wildcard {
+            // Wildcard: return entries starting from dir_offset
+            entries.iter().skip(handle.dir_offset).collect()
+        } else {
+            // Specific filename or pattern: match against entry names
+            entries
+                .iter()
+                .filter(|e| smb_pattern_match(&pattern, &e.name))
+                .collect()
+        };
+
+        if filtered.is_empty() {
+            if is_wildcard && handle.dir_offset >= entries.len() {
+                self.error_response(hdr, STATUS_NO_MORE_FILES, out);
+            } else {
+                self.error_response(hdr, STATUS_NO_MORE_FILES, out);
+            }
             return;
         }
 
@@ -834,9 +900,11 @@ impl SmbSession {
         let mut count = 0;
         let mut entry_starts: Vec<usize> = Vec::new();
 
-        while handle.dir_offset < entries.len() && count < max_entries {
-            let entry = &entries[handle.dir_offset];
-            handle.dir_offset += 1;
+        for entry in &filtered {
+            if count >= max_entries { break; }
+            if is_wildcard {
+                handle.dir_offset += 1;
+            }
             count += 1;
 
             let name_bytes = to_utf16le(&entry.name);
@@ -884,7 +952,7 @@ impl SmbSession {
             dir_data.push(0); // Reserved1
             dir_data.extend_from_slice(&[0u8; 24]); // ShortName (empty)
             dir_data.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
-            dir_data.extend_from_slice(&(handle.dir_offset as u64).to_le_bytes()); // FileId
+            dir_data.extend_from_slice(&(count as u64).to_le_bytes()); // FileId
             dir_data.extend_from_slice(&name_bytes); // FileName
         }
 
