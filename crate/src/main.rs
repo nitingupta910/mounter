@@ -342,7 +342,7 @@ fn is_macos() -> bool {
 
 fn mount_cmd_hint(port: u16, name: &str) -> String {
     if is_macos() {
-        format!("mount_smbfs //guest@localhost:{port}/{name} <mountpoint>")
+        format!("mount_smbfs //guest@{name}.localhost:{port}/{name} <mountpoint>")
     } else {
         format!("gio mount smb://guest@127.0.0.1:{port}/{name}")
     }
@@ -358,7 +358,7 @@ fn spawn_mount(port: u16, name: &str, mount_point: &str) {
     std::thread::spawn(move || {
         let ok = if is_macos() {
             Command::new("mount_smbfs")
-                .args([&format!("//guest@localhost:{port}/{name}"), &mp])
+                .args([&format!("//guest@{name}.localhost:{port}/{name}"), &mp])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
@@ -391,7 +391,9 @@ struct MountInfo {
     path: String,  // mount point, e.g. /Users/x/mnt/myserver
 }
 
-/// Parse `mount` output to find our SMB mounts (guest@localhost).
+/// Parse `mount` output to find our SMB mounts.
+/// Supports both old format (guest@localhost:PORT/SHARE) and
+/// new format (guest@SHARE:PORT/SHARE).
 fn find_smb_mounts() -> Vec<MountInfo> {
     let output = match Command::new("mount").output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
@@ -399,11 +401,6 @@ fn find_smb_mounts() -> Vec<MountInfo> {
     };
     let mut mounts = Vec::new();
     for line in output.lines() {
-        // macOS: //guest:@localhost:44445/name on /Users/x/mnt/name (smbfs, ...)
-        // Linux: //localhost:port/name on /path type smb (via gio/gvfs)
-        if !line.contains("localhost") {
-            continue;
-        }
         if !line.contains("smbfs") && !line.contains("smb") {
             continue;
         }
@@ -413,21 +410,30 @@ fn find_smb_mounts() -> Vec<MountInfo> {
         }
         let source = parts[0];
         let path = parts[2];
-        // Parse source: //guest:@localhost:PORT/SHARE
+        // Parse source: //guest:@HOST:PORT/SHARE
+        // where HOST is either "localhost" (old) or the share name (new)
         if let Some(rest) = source.strip_prefix("//") {
-            // rest = "guest:@localhost:44445/myserver"
-            if let Some(host_start) = rest.find("localhost:") {
-                let after_host = &rest[host_start + "localhost:".len()..];
-                // after_host = "44445/myserver"
-                if let Some(slash) = after_host.find('/') {
-                    let port: u16 = after_host[..slash].parse().unwrap_or(0);
-                    let share = &after_host[slash + 1..];
-                    if port > 0 {
-                        mounts.push(MountInfo {
-                            share: share.to_string(),
-                            port,
-                            path: path.to_string(),
-                        });
+            // rest = "guest:@HOST:PORT/SHARE"
+            if let Some(at) = rest.find('@') {
+                let after_at = &rest[at + 1..];
+                // after_at = "HOST:PORT/SHARE"
+                if let Some(colon) = after_at.find(':') {
+                    let host = &after_at[..colon];
+                    let after_colon = &after_at[colon + 1..];
+                    if let Some(slash) = after_colon.find('/') {
+                        let port: u16 = after_colon[..slash].parse().unwrap_or(0);
+                        let share = &after_colon[slash + 1..];
+                        // Accept: host is "localhost", "SHARE.localhost", or "SHARE"
+                        let is_ours = host == "localhost"
+                            || host == share
+                            || host.strip_suffix(".localhost").is_some_and(|h| h == share);
+                        if port > 0 && is_ours {
+                            mounts.push(MountInfo {
+                                share: share.to_string(),
+                                port,
+                                path: path.to_string(),
+                            });
+                        }
                     }
                 }
             }
