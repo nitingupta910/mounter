@@ -24,6 +24,7 @@ pub const SMB2_CLOSE: u16 = 0x0006;
 pub const SMB2_FLUSH: u16 = 0x0007;
 pub const SMB2_READ: u16 = 0x0008;
 pub const SMB2_WRITE: u16 = 0x0009;
+pub const SMB2_LOCK: u16 = 0x000A;
 pub const SMB2_IOCTL: u16 = 0x000B;
 pub const SMB2_QUERY_DIRECTORY: u16 = 0x000E;
 pub const SMB2_QUERY_INFO: u16 = 0x0010;

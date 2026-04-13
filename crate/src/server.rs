@@ -362,6 +362,7 @@ impl SmbSession {
             SMB2_CLOSE => self.handle_close(&hdr, body, &mut response),
             SMB2_READ => self.handle_read(&hdr, body, &mut response),
             SMB2_WRITE => self.handle_write(&hdr, body, &mut response),
+            SMB2_LOCK => self.handle_lock(&hdr, &mut response),
             SMB2_QUERY_DIRECTORY => self.handle_query_directory(&hdr, body, &mut response),
             SMB2_QUERY_INFO => self.handle_query_info(&hdr, body, &mut response),
             SMB2_SET_INFO => self.handle_set_info(&hdr, body, &mut response),
@@ -1491,6 +1492,16 @@ impl SmbSession {
     // ── FLUSH ───────────────────────────────────────────────────────
 
     fn handle_flush(&mut self, hdr: &Smb2Header, out: &mut Vec<u8>) {
+        let mut resp = Vec::with_capacity(4);
+        resp.extend_from_slice(&4u16.to_le_bytes());
+        resp.extend_from_slice(&0u16.to_le_bytes());
+        hdr.write_response(STATUS_SUCCESS, &resp, out);
+    }
+
+    // ── LOCK ────────────────────────────────────────────────────────
+
+    fn handle_lock(&mut self, hdr: &Smb2Header, out: &mut Vec<u8>) {
+        // MS-SMB2 2.2.26 LOCK Response: StructureSize=4, Reserved=0
         let mut resp = Vec::with_capacity(4);
         resp.extend_from_slice(&4u16.to_le_bytes());
         resp.extend_from_slice(&0u16.to_le_bytes());
