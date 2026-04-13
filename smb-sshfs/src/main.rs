@@ -153,6 +153,7 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
+                let _ = stream.set_nodelay(true); // avoid Nagle latency
                 log::info!(
                     "Client connected: {}",
                     stream

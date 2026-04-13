@@ -8,7 +8,7 @@ use crate::sftp::{DirEntry, FileAttr, SftpError, SftpSession};
 use crate::smb2::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ── macOS noise filter ──────────────────────────────────────────────
 // Files that macOS queries for every directory but never exist on Linux.
@@ -35,7 +35,7 @@ fn wildcard_match(p: &[char], n: &[char], pi: usize, ni: usize) -> bool {
     }
     if p[pi] == '*' {
         // '*' matches zero or more characters
-        for skip in 0..=(n.len() - ni) {
+        for skip in 0..=n.len().saturating_sub(ni) {
             if wildcard_match(p, n, pi + 1, ni + skip) {
                 return true;
             }
@@ -131,6 +131,13 @@ impl AttrCache {
         self.negative.remove(path);
     }
 
+    /// Remove expired entries periodically to prevent unbounded growth.
+    fn evict_expired(&mut self) {
+        let now = Instant::now();
+        self.positive.retain(|_, c| c.expires > now);
+        self.negative.retain(|_, exp| *exp > now);
+    }
+
     fn insert_dir_entries(&mut self, parent: &str, entries: &[DirEntry]) {
         for e in entries {
             let child = format!("{parent}/{}", e.name);
@@ -147,7 +154,7 @@ impl AttrCache {
 const DIR_CACHE_TTL_SECS: u64 = 15;
 
 struct CachedDir {
-    entries: Vec<DirEntry>,
+    entries: Arc<Vec<DirEntry>>,
     expires: Instant,
 }
 
@@ -162,10 +169,10 @@ impl DirCache {
         }
     }
 
-    fn get(&self, path: &str) -> Option<&Vec<DirEntry>> {
+    fn get(&self, path: &str) -> Option<Arc<Vec<DirEntry>>> {
         self.dirs.get(path).and_then(|c| {
             if c.expires > Instant::now() {
-                Some(&c.entries)
+                Some(Arc::clone(&c.entries))
             } else {
                 None
             }
@@ -176,14 +183,19 @@ impl DirCache {
         self.dirs.insert(
             path,
             CachedDir {
-                entries,
-                expires: Instant::now() + std::time::Duration::from_secs(DIR_CACHE_TTL_SECS),
+                entries: Arc::new(entries),
+                expires: Instant::now() + Duration::from_secs(DIR_CACHE_TTL_SECS),
             },
         );
     }
 
     fn invalidate(&mut self, path: &str) {
         self.dirs.remove(path);
+    }
+
+    fn evict_expired(&mut self) {
+        let now = Instant::now();
+        self.dirs.retain(|_, c| c.expires > now);
     }
 }
 
@@ -202,7 +214,7 @@ struct OpenHandle {
     sftp_handle: Option<Vec<u8>>, // None for directories
     path: String,
     is_dir: bool,
-    dir_entries: Option<Vec<DirEntry>>, // cached readdir result
+    dir_entries: Option<Arc<Vec<DirEntry>>>, // shared with dir_cache
     dir_offset: usize,
     readahead: Option<ReadAhead>,
 }
@@ -223,6 +235,7 @@ pub struct SmbSession {
     /// Last handle created — used for related compound requests where
     /// QUERY_INFO/CLOSE reference FileId=0xFFFFFFFF meaning "use CREATE's handle."
     last_create_handle: u64,
+    msg_count: u64,
 }
 
 impl SmbSession {
@@ -239,6 +252,7 @@ impl SmbSession {
             dir_cache: DirCache::new(),
             auth_phase: 0,
             last_create_handle: 0,
+            msg_count: 0,
         }
     }
 
@@ -307,6 +321,13 @@ impl SmbSession {
     // ── Command dispatch ────────────────────────────────────────────
 
     pub fn handle_message(&mut self, msg: &[u8]) -> Vec<u8> {
+        // Periodic cache eviction every 256 messages
+        self.msg_count += 1;
+        if self.msg_count % 256 == 0 {
+            self.cache.evict_expired();
+            self.dir_cache.evict_expired();
+        }
+
         let hdr = match Smb2Header::parse(msg) {
             Some(h) => h,
             None => return Vec::new(),
@@ -950,7 +971,7 @@ impl SmbSession {
             let dir_path = handle.path.clone();
             if let Some(cached) = self.dir_cache.get(&dir_path) {
                 log::debug!("QUERY_DIRECTORY: dir cache hit for {dir_path}");
-                handle.dir_entries = Some(cached.clone());
+                handle.dir_entries = Some(cached);
                 if restart {
                     handle.dir_offset = 0;
                 }
@@ -959,8 +980,8 @@ impl SmbSession {
                     Ok(entries) => {
                         // Populate both caches
                         self.cache.insert_dir_entries(&dir_path, &entries);
-                        self.dir_cache.insert(dir_path, entries.clone());
-                        handle.dir_entries = Some(entries);
+                        self.dir_cache.insert(dir_path.clone(), entries);
+                        handle.dir_entries = self.dir_cache.get(&dir_path);
                         handle.dir_offset = 0;
                     }
                     Err(_) => {
@@ -993,11 +1014,7 @@ impl SmbSession {
         };
 
         if filtered.is_empty() {
-            if is_wildcard && handle.dir_offset >= entries.len() {
-                self.error_response(hdr, STATUS_NO_MORE_FILES, out);
-            } else {
-                self.error_response(hdr, STATUS_NO_MORE_FILES, out);
-            }
+            self.error_response(hdr, STATUS_NO_MORE_FILES, out);
             return;
         }
 
@@ -1337,7 +1354,7 @@ impl SmbSession {
                         self.sftp.remove(&path)
                     };
                     match result {
-                        Ok(()) => self.cache.invalidate(&path),
+                        Ok(()) => self.invalidate_path(&path),
                         Err(_) => {
                             self.error_response(hdr, STATUS_ACCESS_DENIED, out);
                             return;

@@ -646,17 +646,28 @@ impl SftpSession {
             w.flush().map_err(|_| SftpError::Disconnected)?;
         }
 
-        // Collect responses in order
+        // Collect responses in order — must drain ALL responses to keep
+        // the SFTP stream in sync, even on early EOF.
         let mut r = self.reader.lock().map_err(|_| SftpError::Disconnected)?;
+        let mut eof = false;
         for _expected_id in &ids {
             let (t, data) = Self::read_packet(&mut *r)?;
+            if eof {
+                continue; // drain remaining responses
+            }
             if t == SSH_FXP_STATUS {
                 let mut sr = Reader::new(&data[4..]);
                 let code = sr.get_u32()?;
                 if code == SSH_FX_EOF {
-                    break; // partial read is OK
+                    eof = true;
+                    continue; // drain remaining
                 }
+                // Real error — still drain remaining before returning
                 let msg = sr.get_string().unwrap_or_default();
+                // Drain the rest
+                for _ in 0..ids.len().saturating_sub(1) {
+                    let _ = Self::read_packet(&mut *r);
+                }
                 return Err(SftpError::Status(code, msg));
             }
             if t != SSH_FXP_DATA {
@@ -664,7 +675,8 @@ impl SftpSession {
             }
             let chunk = Reader::new(&data[4..]).get_bytes()?;
             if chunk.is_empty() {
-                break;
+                eof = true;
+                continue;
             }
             result.extend_from_slice(&chunk);
         }
