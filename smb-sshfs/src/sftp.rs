@@ -274,6 +274,18 @@ pub struct SftpSession {
 }
 
 impl SftpSession {
+    /// Create a dummy session for unit tests (no real SSH connection).
+    #[cfg(test)]
+    pub fn dummy() -> Self {
+        use std::io::Cursor;
+        SftpSession {
+            reader: Mutex::new(Box::new(Cursor::new(Vec::<u8>::new()))),
+            writer: Mutex::new(Box::new(Cursor::new(Vec::<u8>::new()))),
+            next_id: AtomicU32::new(1),
+            _child: Mutex::new(None),
+        }
+    }
+
     /// Connect to remote host by spawning `ssh -s sftp`.
     pub fn connect(
         host: &str,
