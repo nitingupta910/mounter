@@ -1,8 +1,8 @@
-//! mounter: Single-binary SSH mount for macOS.
+//! mounter: Mount remote SSH directories via SMB2-over-SFTP.
 //!
-//! Combines an SMB2 server + SFTP client in one process.
-//! macOS mounts via `mount_smbfs`, all file ops go directly to SSH.
-//! No Docker, no Samba, no FUSE, no sudo.
+//! Single binary — SMB2 server + SFTP client in one process.
+//! Works on macOS (`mount_smbfs`) and Linux (`gio mount`).
+//! No Docker, no FUSE, no kernel extensions, no sudo.
 
 mod server;
 mod sftp;

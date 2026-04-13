@@ -50,12 +50,12 @@ const SSH_FILEXFER_ATTR_ACMODTIME: u32 = 0x0000_0008;
 const SSH_FILEXFER_ATTR_EXTENDED: u32 = 0x8000_0000;
 
 // Open flags
-const SSH_FXF_READ: u32 = 0x0000_0001;
-const SSH_FXF_WRITE: u32 = 0x0000_0002;
+pub const SSH_FXF_READ: u32 = 0x0000_0001;
+pub const SSH_FXF_WRITE: u32 = 0x0000_0002;
 pub const SSH_FXF_CREAT: u32 = 0x0000_0008;
 pub const SSH_FXF_TRUNC: u32 = 0x0000_0010;
-const SSH_FXF_EXCL: u32 = 0x0000_0020;
-const SSH_FXF_APPEND: u32 = 0x0000_0004;
+pub const SSH_FXF_EXCL: u32 = 0x0000_0020;
+pub const SSH_FXF_APPEND: u32 = 0x0000_0004;
 
 const SFTP_PROTO_VERSION: u32 = 3;
 const MAX_READ_SIZE: u32 = 262144; // 256KB — most servers support this

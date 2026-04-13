@@ -1,10 +1,11 @@
 //! SMB2 protocol types, parsing, and serialization.
 //!
-//! Implements the subset of MS-SMB2 needed for macOS mount_smbfs:
+//! Implements the subset of MS-SMB2 needed for mount_smbfs / SMB clients:
+#![allow(dead_code)] // protocol constants are defined for completeness
 //! NEGOTIATE, SESSION_SETUP, TREE_CONNECT, CREATE, CLOSE, READ, WRITE,
 //! QUERY_DIRECTORY (FIND), QUERY_INFO, SET_INFO, LOGOFF, TREE_DISCONNECT.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 
 // ── Protocol constants ──────────────────────────────────────────────
 
@@ -411,26 +412,6 @@ pub fn filetime_to_unix(ft: u64) -> u64 {
 
 // ── NTLMSSP (minimal guest authentication) ──────────────────────────
 
-/// Build an NTLMSSP CHALLENGE message for guest auth.
-/// This is the simplest possible challenge that macOS accepts.
-pub fn ntlmssp_challenge() -> Vec<u8> {
-    let mut msg = Vec::with_capacity(56);
-    msg.extend_from_slice(b"NTLMSSP\0"); // Signature
-    msg.extend_from_slice(&2u32.to_le_bytes()); // MessageType: CHALLENGE
-                                                // TargetNameFields (Len, MaxLen, Offset) — empty
-    msg.extend_from_slice(&0u16.to_le_bytes()); // TargetNameLen
-    msg.extend_from_slice(&0u16.to_le_bytes()); // TargetNameMaxLen
-    msg.extend_from_slice(&56u32.to_le_bytes()); // TargetNameOffset
-                                                 // NegotiateFlags
-    let flags: u32 = 0x0000_0201; // NTLM | UNICODE
-    msg.extend_from_slice(&flags.to_le_bytes());
-    // ServerChallenge (8 bytes) — doesn't matter for guest
-    msg.extend_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
-    // Reserved (8 bytes)
-    msg.extend_from_slice(&[0u8; 8]);
-    msg
-}
-
 /// Wrap NTLMSSP in a GSS/SPNEGO blob for SESSION_SETUP response.
 pub fn wrap_ntlmssp_in_spnego(ntlmssp: &[u8]) -> Vec<u8> {
     let oid = [
@@ -542,10 +523,4 @@ mod tests {
         assert!(Smb2Header::parse(&buf).is_none());
     }
 
-    #[test]
-    fn ntlmssp_challenge_valid() {
-        let msg = ntlmssp_challenge();
-        assert_eq!(&msg[0..8], b"NTLMSSP\0");
-        assert_eq!(u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]), 2); // CHALLENGE type
-    }
 }

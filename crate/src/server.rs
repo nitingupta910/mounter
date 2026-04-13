@@ -4,7 +4,10 @@
 //! set that mount_smbfs needs: NEGOTIATE, SESSION_SETUP, TREE_CONNECT,
 //! CREATE, CLOSE, READ, WRITE, QUERY_DIRECTORY, QUERY_INFO, SET_INFO.
 
-use crate::sftp::{DirEntry, FileAttr, SftpError, SftpSession};
+use crate::sftp::{
+    DirEntry, FileAttr, SftpError, SftpSession, SSH_FXF_CREAT, SSH_FXF_READ, SSH_FXF_TRUNC,
+    SSH_FXF_WRITE,
+};
 use crate::smb2::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -582,7 +585,7 @@ impl SmbSession {
 
     // ── TREE_CONNECT ────────────────────────────────────────────────
 
-    fn handle_tree_connect(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
+    fn handle_tree_connect(&mut self, hdr: &Smb2Header, _body: &[u8], out: &mut Vec<u8>) {
         // Accept any share name (we only have one)
         let mut resp = Vec::with_capacity(16);
         resp.extend_from_slice(&16u16.to_le_bytes()); // StructureSize
@@ -663,10 +666,11 @@ impl SmbSession {
                                 Err(s) => self.error_response(hdr, s, out),
                             }
                         } else {
-                            match self
-                                .sftp
-                                .open(&path, crate::sftp::SSH_FXF_CREAT | 0x03, 0o644)
-                            {
+                            match self.sftp.open(
+                                &path,
+                                SSH_FXF_CREAT | SSH_FXF_READ | SSH_FXF_WRITE,
+                                0o644,
+                            ) {
                                 Ok(sftp_handle) => {
                                     let _ = self.sftp.close(&sftp_handle);
                                     self.invalidate_path(&path);
@@ -697,10 +701,11 @@ impl SmbSession {
                         return;
                     }
                 } else {
-                    match self
-                        .sftp
-                        .open(&path, crate::sftp::SSH_FXF_CREAT | 0x1a, 0o644)
-                    {
+                    match self.sftp.open(
+                        &path,
+                        SSH_FXF_CREAT | SSH_FXF_WRITE | SSH_FXF_TRUNC,
+                        0o644,
+                    ) {
                         Ok(h) => {
                             let _ = self.sftp.close(&h);
                         }
@@ -718,12 +723,11 @@ impl SmbSession {
                     Err(s) => self.error_response(hdr, s, out),
                 }
             }
-            FILE_OVERWRITE | FILE_OVERWRITE_IF | FILE_SUPERSEDE => {
-                match self.sftp.open(
-                    &path,
-                    crate::sftp::SSH_FXF_CREAT | crate::sftp::SSH_FXF_TRUNC | 0x02,
-                    0o644,
-                ) {
+            FILE_OVERWRITE | FILE_OVERWRITE_IF => {
+                match self
+                    .sftp
+                    .open(&path, SSH_FXF_CREAT | SSH_FXF_TRUNC | SSH_FXF_WRITE, 0o644)
+                {
                     Ok(h) => {
                         let _ = self.sftp.close(&h);
                     }
@@ -846,7 +850,7 @@ impl SmbSession {
 
         // Lazy-open SFTP handle
         if handle.sftp_handle.is_none() {
-            match self.sftp.open(&handle.path, 0x01, 0) {
+            match self.sftp.open(&handle.path, SSH_FXF_READ, 0) {
                 Ok(h) => handle.sftp_handle = Some(h),
                 Err(_) => {
                     self.error_response(hdr, STATUS_ACCESS_DENIED, out);
@@ -929,7 +933,7 @@ impl SmbSession {
 
         // Lazy-open for write
         if handle.sftp_handle.is_none() {
-            match self.sftp.open(&handle.path, 0x02, 0) {
+            match self.sftp.open(&handle.path, SSH_FXF_WRITE, 0) {
                 // WRITE
                 Ok(h) => handle.sftp_handle = Some(h),
                 Err(_) => {
@@ -941,6 +945,7 @@ impl SmbSession {
 
         let sftp_h = handle.sftp_handle.as_ref().map(|h| h.clone());
         let write_path = handle.path.clone();
+        handle.readahead = None; // invalidate — data is changing
         match sftp_h {
             Some(ref h) => match self.sftp.write(h, offset, data) {
                 Ok(()) => {
