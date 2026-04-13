@@ -228,6 +228,8 @@ struct OpenHandle {
     sftp_handle: Option<Vec<u8>>, // None for directories
     path: String,
     is_dir: bool,
+    is_pipe: bool,
+    pipe_response: Option<Vec<u8>>, // buffered DCE/RPC response for named pipes
     dir_entries: Option<Arc<Vec<DirEntry>>>, // shared with dir_cache
     dir_offset: usize,
     readahead: Option<ReadAhead>,
@@ -241,6 +243,8 @@ pub struct SmbSession {
     share_name: String,
     session_id: u64,
     tree_id: u32,
+    next_tree_id: u32,
+    ipc_tree_id: Option<u32>,
     handles: HashMap<u64, OpenHandle>,
     next_handle: u64,
     cache: AttrCache,
@@ -260,6 +264,8 @@ impl SmbSession {
             share_name,
             session_id: 0x0000_0001_0000_0001,
             tree_id: 1,
+            next_tree_id: 2,
+            ipc_tree_id: None,
             handles: HashMap::new(),
             next_handle: 1,
             cache: AttrCache::new(),
@@ -378,7 +384,7 @@ impl SmbSession {
             SMB2_QUERY_INFO => self.handle_query_info(&hdr, body, &mut response),
             SMB2_SET_INFO => self.handle_set_info(&hdr, body, &mut response),
             SMB2_FLUSH => self.handle_flush(&hdr, &mut response),
-            SMB2_IOCTL => self.handle_ioctl(&hdr, &mut response),
+            SMB2_IOCTL => self.handle_ioctl(&hdr, body, &mut response),
             _ => {
                 log::warn!("Unsupported SMB2 command: 0x{:04x}", hdr.command);
                 self.error_response(&hdr, STATUS_NOT_SUPPORTED, &mut response);
@@ -615,33 +621,39 @@ impl SmbSession {
 
     fn handle_tree_connect(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
         // Parse the share path from the request (\\server\share in UTF-16LE)
+        let mut is_ipc = false;
         if body.len() >= 8 {
             let path_offset = read_u16_le(body, 4) as usize;
             let path_length = read_u16_le(body, 6) as usize;
             let path_start = path_offset.saturating_sub(SMB2_HEADER_SIZE);
             if path_start + path_length <= body.len() {
                 let path = from_utf16le(&body[path_start..path_start + path_length]);
-                // Reject IPC$ — we don't support named pipes / share enumeration
-                if path.to_ascii_uppercase().ends_with("\\IPC$") {
-                    log::debug!("Rejecting IPC$ tree connect");
-                    self.error_response(hdr, STATUS_BAD_NETWORK_NAME, out);
-                    return;
-                }
+                is_ipc = path.to_ascii_uppercase().ends_with("\\IPC$");
             }
         }
 
+        let (share_type, tid) = if is_ipc {
+            let tid = self.next_tree_id;
+            self.next_tree_id += 1;
+            self.ipc_tree_id = Some(tid);
+            log::debug!("Tree connected: IPC$ (tid={tid})");
+            (0x02u8, tid) // ShareType: PIPE
+        } else {
+            log::debug!("Tree connected: share={}", self.share_name);
+            (0x01u8, self.tree_id) // ShareType: DISK
+        };
+
         let mut resp = Vec::with_capacity(16);
         resp.extend_from_slice(&16u16.to_le_bytes()); // StructureSize
-        resp.push(0x01); // ShareType: DISK
+        resp.push(share_type);
         resp.push(0); // Reserved
-        resp.extend_from_slice(&0x0000_0030u32.to_le_bytes()); // ShareFlags: manual caching
+        resp.extend_from_slice(&0x0000_0030u32.to_le_bytes()); // ShareFlags
         resp.extend_from_slice(&0u32.to_le_bytes()); // Capabilities
-        resp.extend_from_slice(&0x001F01FFu32.to_le_bytes()); // MaximalAccess: FILE_ALL_ACCESS
+        resp.extend_from_slice(&0x001F01FFu32.to_le_bytes()); // MaximalAccess
 
         let mut full_hdr = hdr.clone();
-        full_hdr.tree_id = self.tree_id;
+        full_hdr.tree_id = tid;
         full_hdr.write_response(STATUS_SUCCESS, &resp, out);
-        log::debug!("Tree connected: share={}", self.share_name);
     }
 
     // ── TREE_DISCONNECT ─────────────────────────────────────────────
@@ -679,6 +691,55 @@ impl SmbSession {
         } else {
             String::new()
         };
+
+        // IPC$ pipe: handle named pipes for share enumeration
+        if self.ipc_tree_id == Some(hdr.tree_id) {
+            let pipe_name = rel_name.to_ascii_lowercase();
+            if pipe_name == "srvsvc" {
+                log::debug!("CREATE: opening pipe srvsvc");
+                let handle_id = self.alloc_handle();
+                self.last_create_handle = handle_id;
+                self.handles.insert(
+                    handle_id,
+                    OpenHandle {
+                        sftp_handle: None,
+                        path: "srvsvc".into(),
+                        is_dir: false,
+                        is_pipe: true,
+                        pipe_response: None,
+                        dir_entries: None,
+                        dir_offset: 0,
+                        readahead: None,
+                    },
+                );
+                // Minimal CREATE response for a pipe
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let ft = unix_to_filetime(now);
+                let mut resp = Vec::with_capacity(96);
+                resp.extend_from_slice(&89u16.to_le_bytes());
+                resp.push(0);
+                resp.push(0);
+                resp.extend_from_slice(&1u32.to_le_bytes()); // FILE_OPENED
+                for _ in 0..4 {
+                    resp.extend_from_slice(&ft.to_le_bytes());
+                }
+                resp.extend_from_slice(&0u64.to_le_bytes()); // AllocationSize
+                resp.extend_from_slice(&0u64.to_le_bytes()); // EndOfFile
+                resp.extend_from_slice(&0x00000080u32.to_le_bytes()); // FILE_ATTRIBUTE_NORMAL
+                resp.extend_from_slice(&0u32.to_le_bytes()); // Reserved2
+                resp.extend_from_slice(&handle_id.to_le_bytes());
+                resp.extend_from_slice(&handle_id.to_le_bytes());
+                resp.extend_from_slice(&0u32.to_le_bytes()); // CreateContextsOffset
+                resp.extend_from_slice(&0u32.to_le_bytes()); // CreateContextsLength
+                hdr.write_response(STATUS_SUCCESS, &resp, out);
+            } else {
+                self.error_response(hdr, STATUS_OBJECT_NAME_NOT_FOUND, out);
+            }
+            return;
+        }
 
         let path = self.full_path(&rel_name);
         let want_dir = create_options & FILE_DIRECTORY_FILE != 0;
@@ -826,6 +887,8 @@ impl SmbSession {
                 sftp_handle: None, // opened lazily on read/write
                 path: path.to_string(),
                 is_dir,
+                is_pipe: false,
+                pipe_response: None,
                 dir_entries: None,
                 dir_offset: 0,
                 readahead: None,
@@ -912,6 +975,16 @@ impl SmbSession {
                 return;
             }
         };
+
+        // Named pipe read: return buffered DCE/RPC response
+        if handle.is_pipe {
+            if let Some(data) = handle.pipe_response.take() {
+                Self::write_read_response(hdr, &data, out);
+            } else {
+                self.error_response(hdr, STATUS_END_OF_FILE, out);
+            }
+            return;
+        }
 
         // Lazy-open SFTP handle
         if handle.sftp_handle.is_none() {
@@ -1009,6 +1082,26 @@ impl SmbSession {
             return;
         }
         let data = &body[data_start..data_start + length];
+
+        let is_pipe = self.handles.get(&fid).map_or(false, |h| h.is_pipe);
+
+        if is_pipe {
+            // Named pipe write: process DCE/RPC and buffer response for READ
+            let rpc_out = self.handle_dcerpc(data);
+            if let Some(h) = self.handles.get_mut(&fid) {
+                h.pipe_response = Some(rpc_out);
+            }
+            // WRITE response
+            let mut resp = Vec::with_capacity(16);
+            resp.extend_from_slice(&17u16.to_le_bytes()); // StructureSize
+            resp.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+            resp.extend_from_slice(&(length as u32).to_le_bytes()); // Count
+            resp.extend_from_slice(&0u32.to_le_bytes()); // Remaining
+            resp.extend_from_slice(&0u16.to_le_bytes()); // WriteChannelInfoOffset
+            resp.extend_from_slice(&0u16.to_le_bytes()); // WriteChannelInfoLength
+            hdr.write_response(STATUS_SUCCESS, &resp, out);
+            return;
+        }
 
         let handle = match self.handles.get_mut(&fid) {
             Some(h) => h,
@@ -1585,8 +1678,215 @@ impl SmbSession {
 
     // ── IOCTL ───────────────────────────────────────────────────────
 
-    fn handle_ioctl(&mut self, hdr: &Smb2Header, out: &mut Vec<u8>) {
-        self.error_response(hdr, STATUS_INVALID_DEVICE_REQUEST, out);
+    fn handle_ioctl(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
+        if body.len() < 56 {
+            self.error_response(hdr, STATUS_INVALID_PARAMETER, out);
+            return;
+        }
+        let ctl_code = read_u32_le(body, 4);
+        let fid = self.resolve_fid(read_u64_le(body, 8));
+        log::debug!("IOCTL: ctl_code=0x{ctl_code:08x} fid={fid}");
+        let input_offset = read_u32_le(body, 24) as usize;
+        let input_count = read_u32_le(body, 28) as usize;
+
+        const FSCTL_PIPE_TRANSACT: u32 = 0x0011C017;
+
+        if ctl_code == FSCTL_PIPE_TRANSACT {
+            let is_pipe = self.handles.get(&fid).map_or(false, |h| h.is_pipe);
+            if !is_pipe {
+                log::debug!("IOCTL PIPE_TRANSACT: fid={fid} not a pipe handle");
+                self.error_response(hdr, STATUS_INVALID_PARAMETER, out);
+                return;
+            }
+
+            // Extract DCE/RPC input data
+            let in_start = input_offset.saturating_sub(SMB2_HEADER_SIZE);
+            let rpc_in = if in_start + input_count <= body.len() {
+                &body[in_start..in_start + input_count]
+            } else {
+                &[]
+            };
+
+            log::debug!(
+                "IOCTL PIPE_TRANSACT: input_len={} pkt_type={}",
+                rpc_in.len(),
+                rpc_in.get(2).copied().unwrap_or(0xff)
+            );
+            let rpc_out = self.handle_dcerpc(rpc_in);
+            log::debug!("IOCTL PIPE_TRANSACT: response_len={}", rpc_out.len());
+
+            // Build IOCTL response
+            let data_offset = (SMB2_HEADER_SIZE + 48) as u32;
+            let mut resp = Vec::with_capacity(48 + rpc_out.len());
+            resp.extend_from_slice(&49u16.to_le_bytes()); // StructureSize
+            resp.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+            resp.extend_from_slice(&ctl_code.to_le_bytes());
+            resp.extend_from_slice(&fid.to_le_bytes()); // FileId.Persistent
+            resp.extend_from_slice(&fid.to_le_bytes()); // FileId.Volatile
+            resp.extend_from_slice(&0u32.to_le_bytes()); // InputOffset
+            resp.extend_from_slice(&0u32.to_le_bytes()); // InputCount
+            resp.extend_from_slice(&data_offset.to_le_bytes()); // OutputOffset
+            resp.extend_from_slice(&(rpc_out.len() as u32).to_le_bytes()); // OutputCount
+            resp.extend_from_slice(&0u32.to_le_bytes()); // Flags
+            resp.extend_from_slice(&0u32.to_le_bytes()); // Reserved2
+            resp.extend_from_slice(&rpc_out);
+            hdr.write_response(STATUS_SUCCESS, &resp, out);
+        } else {
+            self.error_response(hdr, STATUS_INVALID_DEVICE_REQUEST, out);
+        }
+    }
+
+    // ── DCE/RPC ─────────────────────────────────────────────────────
+
+    fn handle_dcerpc(&self, input: &[u8]) -> Vec<u8> {
+        if input.len() < 16 {
+            return Vec::new();
+        }
+        let pkt_type = input[2];
+        let call_id = read_u32_le(input, 12);
+
+        match pkt_type {
+            11 => self.dcerpc_bind_ack(call_id, input),
+            0 => self.dcerpc_request(call_id, input),
+            _ => Vec::new(),
+        }
+    }
+
+    fn dcerpc_bind_ack(&self, call_id: u32, _input: &[u8]) -> Vec<u8> {
+        // NDR transfer syntax UUID: 8a885d04-1ceb-11c9-9fe8-08002b104860
+        let ndr_syntax: [u8; 16] = [
+            0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10,
+            0x48, 0x60,
+        ];
+
+        let secondary_addr = b"\\PIPE\\srvsvc\0";
+        let addr_len = secondary_addr.len() as u16;
+
+        let mut pdu = Vec::with_capacity(100);
+        // DCE/RPC common header (16 bytes)
+        pdu.push(5); // version
+        pdu.push(0); // minor
+        pdu.push(12); // bind_ack
+        pdu.push(0x03); // first+last frag
+        pdu.extend_from_slice(&0x00000010u32.to_le_bytes()); // data rep (LE)
+        pdu.extend_from_slice(&0u16.to_le_bytes()); // frag_length (patched later)
+        pdu.extend_from_slice(&0u16.to_le_bytes()); // auth_length
+        pdu.extend_from_slice(&call_id.to_le_bytes());
+        // bind_ack body
+        pdu.extend_from_slice(&4280u16.to_le_bytes()); // max_xmit_frag
+        pdu.extend_from_slice(&4280u16.to_le_bytes()); // max_recv_frag
+        pdu.extend_from_slice(&1u32.to_le_bytes()); // assoc_group
+        pdu.extend_from_slice(&addr_len.to_le_bytes());
+        pdu.extend_from_slice(secondary_addr);
+        // Pad to 4-byte boundary (from PDU start) before num_results
+        while pdu.len() % 4 != 0 {
+            pdu.push(0);
+        }
+        // results
+        pdu.extend_from_slice(&1u32.to_le_bytes()); // num_results + padding
+        pdu.extend_from_slice(&0u16.to_le_bytes()); // result: acceptance
+        pdu.extend_from_slice(&0u16.to_le_bytes()); // reason
+        pdu.extend_from_slice(&ndr_syntax); // transfer syntax UUID
+        pdu.extend_from_slice(&2u32.to_le_bytes()); // syntax version
+
+        // Patch frag_length
+        let frag_len = pdu.len() as u16;
+        pdu[8..10].copy_from_slice(&frag_len.to_le_bytes());
+        pdu
+    }
+
+    fn dcerpc_request(&self, call_id: u32, input: &[u8]) -> Vec<u8> {
+        if input.len() < 24 {
+            return Vec::new();
+        }
+        let opnum = read_u16_le(input, 22);
+
+        let stub = match opnum {
+            15 => self.srvsvc_net_share_enum(), // NetShareEnumAll
+            _ => {
+                log::debug!("DCE/RPC unsupported opnum: {opnum}");
+                return Vec::new();
+            }
+        };
+
+        // DCE/RPC response header
+        let frag_len = 24 + stub.len();
+        let mut pdu = Vec::with_capacity(frag_len);
+        pdu.push(5);
+        pdu.push(0);
+        pdu.push(2); // response
+        pdu.push(0x03); // first+last
+        pdu.extend_from_slice(&0x00000010u32.to_le_bytes());
+        pdu.extend_from_slice(&(frag_len as u16).to_le_bytes());
+        pdu.extend_from_slice(&0u16.to_le_bytes());
+        pdu.extend_from_slice(&call_id.to_le_bytes());
+        // response body
+        pdu.extend_from_slice(&(stub.len() as u32).to_le_bytes()); // alloc_hint
+        pdu.extend_from_slice(&0u16.to_le_bytes()); // context_id
+        pdu.push(0); // cancel_count
+        pdu.push(0); // reserved
+        pdu.extend_from_slice(&stub);
+        pdu
+    }
+
+    /// Build NDR-encoded NetShareEnumAll response (level 1) listing our share.
+    fn srvsvc_net_share_enum(&self) -> Vec<u8> {
+        let name = &self.share_name;
+        let comment = "";
+
+        // Encode UCS-2 strings (with terminating null)
+        let name_ucs2: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let comment_ucs2: Vec<u16> = comment.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut stub = Vec::with_capacity(128);
+
+        // NetShareInfoCtr struct (level + union)
+        stub.extend_from_slice(&1u32.to_le_bytes()); // Level
+        stub.extend_from_slice(&1u32.to_le_bytes()); // Switch discriminator
+        stub.extend_from_slice(&0x00020000u32.to_le_bytes()); // Ctr1 pointer referent
+
+        // Deferred: NetShareCtr1
+        stub.extend_from_slice(&1u32.to_le_bytes()); // Count
+        stub.extend_from_slice(&0x00020004u32.to_le_bytes()); // Array pointer referent
+
+        // Deferred: array (conformant)
+        stub.extend_from_slice(&1u32.to_le_bytes()); // MaxCount
+
+        // Array elements (SHARE_INFO_1: name_ptr, type, comment_ptr)
+        stub.extend_from_slice(&0x00020008u32.to_le_bytes()); // Name pointer referent
+        stub.extend_from_slice(&0u32.to_le_bytes()); // Type: STYPE_DISKTREE
+        stub.extend_from_slice(&0x0002000Cu32.to_le_bytes()); // Comment pointer referent
+
+        // Deferred strings for element 0: name then comment
+        // Name: conformant varying string
+        stub.extend_from_slice(&(name_ucs2.len() as u32).to_le_bytes()); // MaxCount
+        stub.extend_from_slice(&0u32.to_le_bytes()); // Offset
+        stub.extend_from_slice(&(name_ucs2.len() as u32).to_le_bytes()); // ActualCount
+        for ch in &name_ucs2 {
+            stub.extend_from_slice(&ch.to_le_bytes());
+        }
+        while stub.len() % 4 != 0 {
+            stub.push(0);
+        }
+
+        // Comment: conformant varying string
+        stub.extend_from_slice(&(comment_ucs2.len() as u32).to_le_bytes());
+        stub.extend_from_slice(&0u32.to_le_bytes());
+        stub.extend_from_slice(&(comment_ucs2.len() as u32).to_le_bytes());
+        for ch in &comment_ucs2 {
+            stub.extend_from_slice(&ch.to_le_bytes());
+        }
+        while stub.len() % 4 != 0 {
+            stub.push(0);
+        }
+
+        // TotalEntries
+        stub.extend_from_slice(&1u32.to_le_bytes());
+        // ResumeHandle pointer (null)
+        stub.extend_from_slice(&0u32.to_le_bytes());
+        // Return value: WERR_OK
+        stub.extend_from_slice(&0u32.to_le_bytes());
+        stub
     }
 }
 
