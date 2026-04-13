@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Match an SMB search pattern against a filename.
 /// Supports '*' (any chars), '?' (single char), and literal matches.
-fn smb_pattern_match(pattern: &str, name: &str) -> bool {
+pub fn smb_pattern_match(pattern: &str, name: &str) -> bool {
     if pattern == "*" {
         return true;
     }
@@ -50,7 +50,7 @@ fn wildcard_match(p: &[char], n: &[char], pi: usize, ni: usize) -> bool {
     }
 }
 
-fn is_apple_metadata(name: &str) -> bool {
+pub fn is_apple_metadata(name: &str) -> bool {
     name == ".DS_Store"
         || name == ".localized"
         || name == ".hidden"
@@ -68,26 +68,26 @@ fn is_apple_metadata(name: &str) -> bool {
 const CACHE_TTL_SECS: u64 = 30;
 const NEG_CACHE_TTL_SECS: u64 = 60; // longer for negative since Apple metadata never exists
 
-struct CachedAttr {
+pub struct CachedAttr {
     attr: FileAttr,
     is_dir: bool,
     expires: Instant,
 }
 
-struct AttrCache {
+pub struct AttrCache {
     positive: HashMap<String, CachedAttr>,
     negative: HashMap<String, Instant>,
 }
 
 impl AttrCache {
-    fn new() -> Self {
+    pub fn new() -> Self {
         AttrCache {
             positive: HashMap::new(),
             negative: HashMap::new(),
         }
     }
 
-    fn get(&self, path: &str) -> Option<(&FileAttr, bool)> {
+    pub fn get(&self, path: &str) -> Option<(&FileAttr, bool)> {
         self.positive.get(path).and_then(|c| {
             if c.expires > Instant::now() {
                 Some((&c.attr, c.is_dir))
@@ -97,14 +97,14 @@ impl AttrCache {
         })
     }
 
-    fn is_negative(&self, path: &str) -> bool {
+    pub fn is_negative(&self, path: &str) -> bool {
         self.negative
             .get(path)
             .map(|exp| *exp > Instant::now())
             .unwrap_or(false)
     }
 
-    fn insert(&mut self, path: String, attr: FileAttr, is_dir: bool) {
+    pub fn insert(&mut self, path: String, attr: FileAttr, is_dir: bool) {
         self.negative.remove(&path);
         self.positive.insert(
             path,
@@ -116,7 +116,7 @@ impl AttrCache {
         );
     }
 
-    fn insert_negative(&mut self, path: String) {
+    pub fn insert_negative(&mut self, path: String) {
         let ttl = if is_apple_metadata(path.rsplit('/').next().unwrap_or("")) {
             NEG_CACHE_TTL_SECS
         } else {
@@ -126,19 +126,19 @@ impl AttrCache {
             .insert(path, Instant::now() + std::time::Duration::from_secs(ttl));
     }
 
-    fn invalidate(&mut self, path: &str) {
+    pub fn invalidate(&mut self, path: &str) {
         self.positive.remove(path);
         self.negative.remove(path);
     }
 
     /// Remove expired entries periodically to prevent unbounded growth.
-    fn evict_expired(&mut self) {
+    pub fn evict_expired(&mut self) {
         let now = Instant::now();
         self.positive.retain(|_, c| c.expires > now);
         self.negative.retain(|_, exp| *exp > now);
     }
 
-    fn insert_dir_entries(&mut self, parent: &str, entries: &[DirEntry]) {
+    pub fn insert_dir_entries(&mut self, parent: &str, entries: &[DirEntry]) {
         for e in entries {
             let child = format!("{parent}/{}", e.name);
             let is_dir = e.attrs.perm & 0o40000 != 0;
@@ -153,23 +153,23 @@ impl AttrCache {
 
 const DIR_CACHE_TTL_SECS: u64 = 15;
 
-struct CachedDir {
+pub struct CachedDir {
     entries: Arc<Vec<DirEntry>>,
     expires: Instant,
 }
 
-struct DirCache {
+pub struct DirCache {
     dirs: HashMap<String, CachedDir>,
 }
 
 impl DirCache {
-    fn new() -> Self {
+    pub fn new() -> Self {
         DirCache {
             dirs: HashMap::new(),
         }
     }
 
-    fn get(&self, path: &str) -> Option<Arc<Vec<DirEntry>>> {
+    pub fn get(&self, path: &str) -> Option<Arc<Vec<DirEntry>>> {
         self.dirs.get(path).and_then(|c| {
             if c.expires > Instant::now() {
                 Some(Arc::clone(&c.entries))
@@ -179,7 +179,7 @@ impl DirCache {
         })
     }
 
-    fn insert(&mut self, path: String, entries: Vec<DirEntry>) {
+    pub fn insert(&mut self, path: String, entries: Vec<DirEntry>) {
         self.dirs.insert(
             path,
             CachedDir {
@@ -189,11 +189,11 @@ impl DirCache {
         );
     }
 
-    fn invalidate(&mut self, path: &str) {
+    pub fn invalidate(&mut self, path: &str) {
         self.dirs.remove(path);
     }
 
-    fn evict_expired(&mut self) {
+    pub fn evict_expired(&mut self) {
         let now = Instant::now();
         self.dirs.retain(|_, c| c.expires > now);
     }
