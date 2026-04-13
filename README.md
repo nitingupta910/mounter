@@ -1,31 +1,65 @@
 # mounter
 
-Mount remote SSH directories in macOS Finder. No macFUSE, no Docker, no sudo.
+Mount remote SSH directories in your file manager. No FUSE, no Docker, no kernel extensions.
+
+Works on macOS and Linux.
 
 ## Quick start
 
 ```bash
 cd smb-sshfs
 cargo build --release
-# Start the SMB-to-SFTP bridge
-./target/release/smb-sshfs user@server:/path
 
-# In another terminal, mount it
-mkdir -p ~/mnt/server
-mount_smbfs //guest@localhost:<port>/server ~/mnt/server
+# One command: mount, serve, Ctrl-C to stop
+./target/release/smb-sshfs mount user@server:/path
 ```
 
-The server prints the exact `mount_smbfs` command to run.
+Or start the server and mount separately:
+
+```bash
+./target/release/smb-sshfs user@server:/path          # prints mount command
+mount_smbfs //guest@localhost:<port>/server ~/mnt/server   # macOS
+```
+
+## Commands
+
+```
+smb-sshfs mount [user@]host:[path] [opts]   Mount and serve (Ctrl-C to stop)
+smb-sshfs [user@]host:[path] [opts]         Start SMB server only
+smb-sshfs unmount <name|path|all>            Unmount cleanly (handles busy mounts)
+smb-sshfs list                               Show active mounts
+```
+
+Options:
+
+```
+  -p PORT         SSH port (default: 22)
+  -i IDENTITY     SSH identity file
+  -n NAME         Share name (default: host)
+  --smb-port PORT Local SMB port (default: auto)
+```
 
 ## How it works
 
 ```
-Finder <--SMB2--> smb-sshfs (localhost) <--SFTP/SSH--> remote server
+File manager <--SMB2--> smb-sshfs (localhost) <--SFTP/SSH--> remote server
 ```
 
-`smb-sshfs` is a single Rust binary that speaks SMB2 to macOS and SFTP v3 to
-the remote. It spawns `ssh -s sftp` as a subprocess -- existing SSH keys,
+`smb-sshfs` is a single Rust binary that speaks SMB2 to your OS and SFTP v3 to
+the remote. It spawns `ssh -s sftp` as a subprocess — existing SSH keys,
 config, and agent just work. No kernel extensions, no privileged containers.
+
+## Platform support
+
+| Platform | Mount method | Status |
+|----------|-------------|--------|
+| macOS | `mount_smbfs` (built-in) | Full support |
+| Linux | `smbclient` / userspace tools | Works |
+| Linux | `mount -t cifs` (kernel) | Needs NTLMSSP improvements |
+
+On Linux, the SMB2 server works — `smbclient` can list and read files. The
+kernel `mount.cifs` driver requires stricter NTLMSSP authentication than
+macOS's client; this is being worked on.
 
 ## Performance
 
@@ -39,30 +73,19 @@ Benchmarked against raw `ssh cat` on the same connection:
 | 108 MB sequential read | 91% of SSH throughput |
 
 Key optimizations:
-- **Session-level directory cache** -- macOS sends hundreds of per-file
+- **Session-level directory cache** — macOS sends hundreds of per-file
   QUERY_DIRECTORY lookups for `ls -la`; all served from a 15s TTL cache
   after one SFTP readdir.
-- **Pipelined SFTP reads** -- large reads send multiple 256KB requests
+- **Pipelined SFTP reads** — large reads send multiple 256KB requests
   in parallel to saturate the SSH pipe.
-- **Read caching** -- each SFTP response is cached so macOS's 2KB
+- **Read caching** — each SFTP response is cached so small
   resource-fork probes don't trigger extra round-trips.
-- **Negative caching** -- Apple metadata files (.DS_Store, ._*, etc.)
+- **Negative caching** — Apple metadata files (.DS_Store, ._*, etc.)
   that never exist on Linux are cached as absent for 60s.
-
-## Options
-
-```
-smb-sshfs [user@]host:[path] [options]
-
-  -p PORT         SSH port (default: 22)
-  -i IDENTITY     SSH identity file
-  -n NAME         Share name (default: host)
-  --smb-port PORT Local SMB port (default: auto)
-```
 
 ## Requirements
 
-- macOS
+- macOS or Linux
 - SSH key auth to your remote server
 - Rust toolchain (to build)
 

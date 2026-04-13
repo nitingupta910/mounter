@@ -17,21 +17,19 @@ use std::process;
 use std::sync::Arc;
 
 fn usage() -> ! {
-    eprintln!("smb-sshfs — mount remote SSH directories in Finder");
+    eprintln!("smb-sshfs — mount remote SSH directories via SMB2-over-SFTP");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  smb-sshfs [user@]host:[path] [options]   Start SMB server");
-    eprintln!("  smb-sshfs unmount <name|path|all>        Unmount cleanly");
-    eprintln!("  smb-sshfs list                           Show active mounts");
+    eprintln!("  smb-sshfs mount [user@]host:[path] [opts]  Mount and run (Ctrl-C to unmount)");
+    eprintln!("  smb-sshfs [user@]host:[path] [opts]        Start SMB server only");
+    eprintln!("  smb-sshfs unmount <name|path|all>           Unmount cleanly");
+    eprintln!("  smb-sshfs list                              Show active mounts");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -p PORT         SSH port (default: 22)");
     eprintln!("  -i IDENTITY     SSH identity file");
     eprintln!("  -n NAME         Share name (default: host)");
     eprintln!("  --smb-port PORT Local SMB port (default: auto)");
-    eprintln!();
-    eprintln!("After starting, mount with:");
-    eprintln!("  mount_smbfs //guest@localhost:<port>/<name> ~/mnt/<name>");
     process::exit(1);
 }
 
@@ -46,6 +44,7 @@ fn main() {
     }
 
     // Subcommands
+    let auto_mount = args[1] == "mount";
     match args[1].as_str() {
         "unmount" | "umount" => {
             let target = args.get(2).map(|s| s.as_str()).unwrap_or_else(|| {
@@ -62,13 +61,22 @@ fn main() {
         _ => {}
     }
 
-    let remote = &args[1];
+    // For "mount" subcommand, shift args: smb-sshfs mount user@host:path → remote is args[2]
+    let remote_idx = if auto_mount { 2 } else { 1 };
+    let remote = match args.get(remote_idx) {
+        Some(r) => r,
+        None => {
+            eprintln!("Missing remote spec. Usage: smb-sshfs mount [user@]host:[path]");
+            process::exit(1);
+        }
+    };
+    let opt_start = remote_idx + 1;
     let mut ssh_port: u16 = 22;
     let mut identity: Option<String> = None;
     let mut share_name: Option<String> = None;
     let mut smb_port: u16 = 0; // 0 = auto-assign
 
-    let mut i = 2;
+    let mut i = opt_start;
     while i < args.len() {
         match args[i].as_str() {
             "-p" => {
@@ -166,10 +174,17 @@ fn main() {
     let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
 
     log::info!("SMB server listening on 127.0.0.1:{local_port}");
-    println!("Mount with:");
-    println!("  mount_smbfs //guest@localhost:{local_port}/{name} ~/mnt/{name}");
 
-    // Accept connections (single-threaded — one macOS client)
+    if auto_mount {
+        // Spawn mount in background — it will connect once accept loop starts
+        spawn_mount(local_port, &name);
+        println!("Press Ctrl-C to stop. Clean up with: smb-sshfs unmount {name}");
+    } else {
+        println!("Mount with:");
+        println!("  {}", mount_cmd_hint(local_port, &name));
+    }
+
+    // Accept connections (single-threaded — one client at a time)
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -296,9 +311,115 @@ fn main() {
     }
 }
 
-// ── Subcommands ─────────────────────────────────────────────────────
+// ── Platform-aware mount/unmount ────────────────────────────────────
 
 use std::process::Command;
+
+fn is_macos() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn mount_cmd_hint(port: u16, name: &str) -> String {
+    if is_macos() {
+        format!("mount_smbfs //guest@localhost:{port}/{name} ~/mnt/{name}")
+    } else {
+        format!("sudo mount -t cifs //127.0.0.1/{name} ~/mnt/{name} -o guest,vers=2.0,port={port}")
+    }
+}
+
+/// Spawn the mount command in the background (non-blocking).
+/// The mount will complete once the SMB server starts accepting connections.
+fn spawn_mount(port: u16, name: &str) -> String {
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let mount_point = format!("{home}/mnt/{name}");
+    let _ = std::fs::create_dir_all(&mount_point);
+
+    let mp = mount_point.clone();
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        let ok = if is_macos() {
+            Command::new("mount_smbfs")
+                .args([&format!("//guest@localhost:{port}/{name}"), &mp])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        } else {
+            // Linux: try mount -t cifs (needs root), fall back to gio mount
+            let cifs_ok = Command::new("sudo")
+                .args([
+                    "mount",
+                    "-t",
+                    "cifs",
+                    &format!("//127.0.0.1/{name}"),
+                    &mp,
+                    "-o",
+                    &format!("guest,vers=2.0,port={port}"),
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if cifs_ok {
+                true
+            } else {
+                Command::new("gio")
+                    .args(["mount", &format!("smb://guest@localhost:{port}/{name}")])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            }
+        };
+
+        if ok {
+            eprintln!("Mounted at {mp}");
+        } else {
+            eprintln!(
+                "Mount failed. Try manually:\n  {}",
+                mount_cmd_hint(port, &name)
+            );
+        }
+    });
+
+    mount_point
+}
+
+/// Unmount a path with platform-appropriate escalation.
+fn do_unmount(path: &str) {
+    // Strategy 1: umount (works on both platforms)
+    if Command::new("umount")
+        .arg(path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    if is_macos() {
+        // macOS strategy 2: diskutil
+        if Command::new("diskutil")
+            .args(["unmount", "force", path])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+    } else {
+        // Linux strategy 2: lazy unmount
+        if Command::new("umount")
+            .args(["-l", path])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+
+    eprintln!("Warning: could not unmount {path}");
+}
+
+// ── Subcommands ─────────────────────────────────────────────────────
 
 /// An active smb-sshfs mount parsed from `mount` output.
 struct MountInfo {
@@ -316,8 +437,12 @@ fn find_smb_mounts() -> Vec<MountInfo> {
     };
     let mut mounts = Vec::new();
     for line in output.lines() {
-        // Format: //guest:@localhost:44445/name on /Users/x/mnt/name (smbfs, ...)
-        if !line.contains("smbfs") || !line.contains("localhost") {
+        // macOS: //guest:@localhost:44445/name on /Users/x/mnt/name (smbfs, ...)
+        // Linux: //localhost/name on /home/x/mnt/name type cifs (...)
+        if !line.contains("localhost") {
+            continue;
+        }
+        if !line.contains("smbfs") && !line.contains("cifs") {
             continue;
         }
         let parts: Vec<&str> = line.splitn(4, ' ').collect();
@@ -396,31 +521,43 @@ fn unmount_one(info: &MountInfo) -> bool {
         return true;
     }
 
-    // Strategy 2: diskutil unmount
-    if Command::new("diskutil")
-        .args(["unmount", &info.path])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        eprintln!("  unmounted (diskutil)");
-        kill_server(info.port);
-        return true;
+    // Strategy 2: platform-specific
+    if is_macos() {
+        if Command::new("diskutil")
+            .args(["unmount", &info.path])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("  unmounted (diskutil)");
+            kill_server(info.port);
+            return true;
+        }
     }
 
     // Strategy 3: kill the server first, then force unmount.
-    // Killing the server drops the TCP connection, which makes macOS
+    // Killing the server drops the TCP connection, which makes the OS
     // release the mount more willingly.
     eprintln!("  mount busy — killing server and force-unmounting");
     kill_server(info.port);
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    if Command::new("diskutil")
-        .args(["unmount", "force", &info.path])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
+    let force_ok = if is_macos() {
+        Command::new("diskutil")
+            .args(["unmount", "force", &info.path])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        // Linux: lazy unmount detaches immediately
+        Command::new("umount")
+            .args(["-l", &info.path])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+
+    if force_ok {
         eprintln!("  force-unmounted");
         return true;
     }
