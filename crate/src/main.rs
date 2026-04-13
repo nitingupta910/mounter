@@ -9,7 +9,7 @@ mod sftp;
 mod smb2;
 
 use server::SmbSession;
-use sftp::SftpSession;
+use sftp::ReconnectingSftp;
 use std::env;
 use std::io::Write;
 use std::net::TcpListener;
@@ -157,13 +157,14 @@ fn main() {
 
     // Connect via SFTP
     log::info!("Connecting to {host}:{ssh_port}...");
-    let sftp = match SftpSession::connect(&host, ssh_port, user.as_deref(), identity.as_deref()) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("SSH connection failed: {e}");
-            process::exit(1);
-        }
-    };
+    let sftp =
+        match ReconnectingSftp::connect(&host, ssh_port, user.as_deref(), identity.as_deref()) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                eprintln!("SSH connection failed: {e}");
+                process::exit(1);
+            }
+        };
 
     // Resolve remote path
     let root = if remote_path.is_empty() || remote_path == "." {

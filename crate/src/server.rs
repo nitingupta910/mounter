@@ -5,8 +5,8 @@
 //! CREATE, CLOSE, READ, WRITE, QUERY_DIRECTORY, QUERY_INFO, SET_INFO.
 
 use crate::sftp::{
-    DirEntry, FileAttr, SftpError, SftpSession, SSH_FXF_CREAT, SSH_FXF_READ, SSH_FXF_TRUNC,
-    SSH_FXF_WRITE,
+    DirEntry, FileAttr, ReconnectingSftp, SftpError, SftpSession, SSH_FXF_CREAT, SSH_FXF_READ,
+    SSH_FXF_TRUNC, SSH_FXF_WRITE,
 };
 use crate::smb2::*;
 use std::collections::HashMap;
@@ -225,7 +225,7 @@ struct OpenHandle {
 // ── SMB2 Server Session ─────────────────────────────────────────────
 
 pub struct SmbSession {
-    sftp: Arc<SftpSession>,
+    sftp: Arc<ReconnectingSftp>,
     root_path: String,
     share_name: String,
     session_id: u64,
@@ -242,7 +242,7 @@ pub struct SmbSession {
 }
 
 impl SmbSession {
-    pub fn new(sftp: Arc<SftpSession>, root_path: String, share_name: String) -> Self {
+    pub fn new(sftp: Arc<ReconnectingSftp>, root_path: String, share_name: String) -> Self {
         SmbSession {
             sftp,
             root_path,
@@ -274,6 +274,20 @@ impl SmbSession {
         if let Some((parent, _)) = path.rsplit_once('/') {
             self.dir_cache.invalidate(parent);
         }
+    }
+
+    /// Called after SFTP reconnect — all SFTP file handles are dead,
+    /// and remote state may have changed.
+    fn on_reconnect(&mut self) {
+        log::info!("Flushing caches and handles after reconnect");
+        // Invalidate all SFTP handles — they belong to the dead session
+        for (_id, handle) in self.handles.iter_mut() {
+            handle.sftp_handle = None;
+            handle.readahead = None;
+        }
+        // Flush all caches — remote state may have changed
+        self.cache = AttrCache::new();
+        self.dir_cache = DirCache::new();
     }
 
     fn full_path(&self, rel: &str) -> String {
@@ -870,8 +884,11 @@ impl SmbSession {
             }
         }
 
-        // Read from SFTP — cache result for small follow-up reads
+        // Read from SFTP — cache result for small follow-up reads.
+        // On disconnect, the ReconnectingSftp will reconnect, but our handle
+        // is dead. Reopen and retry once.
         let sftp_h = handle.sftp_handle.as_ref().map(|h| h.clone());
+        let path = handle.path.clone();
         match sftp_h {
             Some(ref h) => match self.sftp.read(h, offset, length as u32) {
                 Ok(data) if data.is_empty() => {
@@ -880,9 +897,29 @@ impl SmbSession {
                 Ok(data) => {
                     let respond_len = (length as usize).min(data.len());
                     Self::write_read_response(hdr, &data[..respond_len], out);
-                    // Cache for small follow-up reads
                     if let Some(h) = self.handles.get_mut(&fid) {
                         h.readahead = Some(ReadAhead { data, offset });
+                    }
+                }
+                Err(SftpError::Disconnected) => {
+                    // Handle is dead — reconnect happened, reopen and retry
+                    self.on_reconnect();
+                    match self.sftp.open(&path, SSH_FXF_READ, 0) {
+                        Ok(new_h) => match self.sftp.read(&new_h, offset, length as u32) {
+                            Ok(data) if data.is_empty() => {
+                                self.error_response(hdr, STATUS_END_OF_FILE, out);
+                            }
+                            Ok(data) => {
+                                let respond_len = (length as usize).min(data.len());
+                                Self::write_read_response(hdr, &data[..respond_len], out);
+                                if let Some(h) = self.handles.get_mut(&fid) {
+                                    h.sftp_handle = Some(new_h);
+                                    h.readahead = Some(ReadAhead { data, offset });
+                                }
+                            }
+                            Err(_) => self.error_response(hdr, STATUS_ACCESS_DENIED, out),
+                        },
+                        Err(_) => self.error_response(hdr, STATUS_ACCESS_DENIED, out),
                     }
                 }
                 Err(_) => self.error_response(hdr, STATUS_ACCESS_DENIED, out),
@@ -946,24 +983,40 @@ impl SmbSession {
         let sftp_h = handle.sftp_handle.as_ref().map(|h| h.clone());
         let write_path = handle.path.clone();
         handle.readahead = None; // invalidate — data is changing
-        match sftp_h {
+        let write_result = match sftp_h {
             Some(ref h) => match self.sftp.write(h, offset, data) {
-                Ok(()) => {
-                    self.invalidate_path(&write_path);
-                    let mut resp = Vec::with_capacity(16);
-                    resp.extend_from_slice(&17u16.to_le_bytes()); // StructureSize
-                    resp.extend_from_slice(&0u16.to_le_bytes()); // Reserved
-                    resp.extend_from_slice(&(length as u32).to_le_bytes()); // Count
-                    resp.extend_from_slice(&0u32.to_le_bytes()); // Remaining
-                    resp.extend_from_slice(&0u16.to_le_bytes()); // WriteChannelInfoOffset
-                    resp.extend_from_slice(&0u16.to_le_bytes()); // WriteChannelInfoLength
-                                                                 // Padding
-                    resp.push(0);
-                    hdr.write_response(STATUS_SUCCESS, &resp, out);
+                Err(SftpError::Disconnected) => {
+                    // Reconnect happened, reopen handle and retry
+                    self.on_reconnect();
+                    match self.sftp.open(&write_path, SSH_FXF_WRITE, 0) {
+                        Ok(new_h) => {
+                            let r = self.sftp.write(&new_h, offset, data);
+                            if let Some(h) = self.handles.get_mut(&fid) {
+                                h.sftp_handle = Some(new_h);
+                            }
+                            r
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
-                Err(_) => self.error_response(hdr, STATUS_ACCESS_DENIED, out),
+                other => other,
             },
-            None => self.error_response(hdr, STATUS_INVALID_PARAMETER, out),
+            None => Err(SftpError::Disconnected),
+        };
+        match write_result {
+            Ok(()) => {
+                self.invalidate_path(&write_path);
+                let mut resp = Vec::with_capacity(16);
+                resp.extend_from_slice(&17u16.to_le_bytes()); // StructureSize
+                resp.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+                resp.extend_from_slice(&(length as u32).to_le_bytes()); // Count
+                resp.extend_from_slice(&0u32.to_le_bytes()); // Remaining
+                resp.extend_from_slice(&0u16.to_le_bytes()); // WriteChannelInfoOffset
+                resp.extend_from_slice(&0u16.to_le_bytes()); // WriteChannelInfoLength
+                resp.push(0); // Padding
+                hdr.write_response(STATUS_SUCCESS, &resp, out);
+            }
+            Err(_) => self.error_response(hdr, STATUS_ACCESS_DENIED, out),
         }
     }
 
@@ -1814,7 +1867,7 @@ mod tests {
     // ── Helper: create a minimal SmbSession for testing ────────────
 
     fn make_test_session() -> SmbSession {
-        let sftp = Arc::new(SftpSession::dummy());
+        let sftp = Arc::new(ReconnectingSftp::dummy());
         SmbSession::new(sftp, "/home/user".into(), "test".into())
     }
 }

@@ -522,5 +522,4 @@ mod tests {
         let buf = [0u8; 32];
         assert!(Smb2Header::parse(&buf).is_none());
     }
-
 }
