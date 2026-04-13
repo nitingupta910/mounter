@@ -64,6 +64,17 @@ pub fn is_apple_metadata(name: &str) -> bool {
         || name == ".fseventsd"
         || name == ".TemporaryItems"
         || name == ".com.apple.timemachine.donotpresent"
+        || name == ".metadata_never_index"
+        || name == ".metadata_never_index_unless_rootfs"
+        || name == ".metadata_direct_scope_only"
+        || name == "mdssvc"
+        || name == "MsFteWds"
+}
+
+/// Files we fake as existing empty files in the share root so macOS
+/// Spotlight skips indexing the entire volume.
+fn is_spotlight_inhibitor(name: &str) -> bool {
+    name == ".metadata_never_index"
 }
 
 // ── Attr cache ──────────────────────────────────────────────────────
@@ -659,6 +670,25 @@ impl SmbSession {
 
         log::debug!("CREATE: path={path} disposition={create_disposition} dir={want_dir}");
 
+        // Fake Spotlight-inhibitor files so macOS doesn't recursively index the volume
+        let basename = rel_name.rsplit(['/', '\\']).next().unwrap_or("");
+        if is_spotlight_inhibitor(basename) && !rel_name.contains('/') && !rel_name.contains('\\') {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as u32;
+            let fake_attr = FileAttr {
+                size: 0,
+                uid: 0,
+                gid: 0,
+                perm: 0o100444,
+                atime: now_secs,
+                mtime: now_secs,
+            };
+            self.respond_create_success(hdr, &path, &fake_attr, false, out);
+            return;
+        }
+
         // Handle create dispositions
         // FILE_SUPERSEDE (0) is treated as FILE_OPEN for existing files (macOS uses it for share root)
         match create_disposition {
@@ -1106,9 +1136,33 @@ impl SmbSession {
             }
         };
 
+        // Fake Spotlight-inhibitor files so macOS skips volume indexing
+        let fake_entry;
+        if is_spotlight_inhibitor(&pattern) {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as u32;
+            fake_entry = Some(DirEntry {
+                name: pattern.clone(),
+                attrs: FileAttr {
+                    size: 0,
+                    uid: 0,
+                    gid: 0,
+                    perm: 0o100444,
+                    atime: now_secs,
+                    mtime: now_secs,
+                },
+            });
+        } else {
+            fake_entry = None;
+        }
+
         // Filter entries by search pattern
         let is_wildcard = pattern == "*";
-        let filtered: Vec<&DirEntry> = if is_wildcard {
+        let filtered: Vec<&DirEntry> = if let Some(ref fe) = fake_entry {
+            vec![fe]
+        } else if is_wildcard {
             // Wildcard: return entries starting from dir_offset
             entries.iter().skip(handle.dir_offset).collect()
         } else {
