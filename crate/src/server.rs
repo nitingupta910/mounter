@@ -613,8 +613,23 @@ impl SmbSession {
 
     // ── TREE_CONNECT ────────────────────────────────────────────────
 
-    fn handle_tree_connect(&mut self, hdr: &Smb2Header, _body: &[u8], out: &mut Vec<u8>) {
-        // Accept any share name (we only have one)
+    fn handle_tree_connect(&mut self, hdr: &Smb2Header, body: &[u8], out: &mut Vec<u8>) {
+        // Parse the share path from the request (\\server\share in UTF-16LE)
+        if body.len() >= 8 {
+            let path_offset = read_u16_le(body, 4) as usize;
+            let path_length = read_u16_le(body, 6) as usize;
+            let path_start = path_offset.saturating_sub(SMB2_HEADER_SIZE);
+            if path_start + path_length <= body.len() {
+                let path = from_utf16le(&body[path_start..path_start + path_length]);
+                // Reject IPC$ — we don't support named pipes / share enumeration
+                if path.to_ascii_uppercase().ends_with("\\IPC$") {
+                    log::debug!("Rejecting IPC$ tree connect");
+                    self.error_response(hdr, STATUS_BAD_NETWORK_NAME, out);
+                    return;
+                }
+            }
+        }
+
         let mut resp = Vec::with_capacity(16);
         resp.extend_from_slice(&16u16.to_le_bytes()); // StructureSize
         resp.push(0x01); // ShareType: DISK
