@@ -542,7 +542,8 @@ impl SftpSession {
             w.flush().map_err(|_| SftpError::Disconnected)?;
         }
 
-        // Read responses, refilling pipeline as we go
+        // Read responses, refilling pipeline as we go.
+        // Verify response IDs to detect out-of-order responses.
         while pending > 0 {
             let (t, data) = self.recv()?;
             pending -= 1;
@@ -555,6 +556,11 @@ impl SftpSession {
                     continue; // drain remaining pending responses
                 }
                 let msg = sr.get_string().unwrap_or_default();
+                // Drain remaining before returning
+                while pending > 0 {
+                    let _ = self.recv();
+                    pending -= 1;
+                }
                 let _ = self.close_handle(&handle);
                 return Err(SftpError::Status(code, msg));
             }
@@ -564,7 +570,7 @@ impl SftpSession {
                 return Err(SftpError::Protocol(format!("expected NAME, got {t}")));
             }
 
-            // Parse entries from this batch
+            // Parse entries from this batch (skip 4-byte id)
             let mut r = Reader::new(&data[4..]);
             let count = r.get_u32()?;
             for _ in 0..count {
@@ -660,13 +666,32 @@ impl SftpSession {
 
         // Collect responses in order — must drain ALL responses to keep
         // the SFTP stream in sync, even on early EOF.
+        // IMPORTANT: verify response IDs match to prevent silent data corruption
+        // if responses arrive out of order.
         let mut r = self.reader.lock().map_err(|_| SftpError::Disconnected)?;
         let mut eof = false;
-        for _expected_id in &ids {
+        let total_ids = ids.len();
+        for (idx, &expected_id) in ids.iter().enumerate() {
             let (t, data) = Self::read_packet(&mut *r)?;
             if eof {
                 continue; // drain remaining responses
             }
+
+            // Verify response ID matches the request we sent
+            if data.len() >= 4 {
+                let resp_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                if resp_id != expected_id {
+                    // Drain remaining and return error — stream is out of sync
+                    let remaining = total_ids - idx - 1;
+                    for _ in 0..remaining {
+                        let _ = Self::read_packet(&mut *r);
+                    }
+                    return Err(SftpError::Protocol(format!(
+                        "pipelined read: id mismatch at chunk {idx}: expected {expected_id}, got {resp_id}"
+                    )));
+                }
+            }
+
             if t == SSH_FXP_STATUS {
                 let mut sr = Reader::new(&data[4..]);
                 let code = sr.get_u32()?;
@@ -674,10 +699,10 @@ impl SftpSession {
                     eof = true;
                     continue; // drain remaining
                 }
-                // Real error — still drain remaining before returning
                 let msg = sr.get_string().unwrap_or_default();
-                // Drain the rest
-                for _ in 0..ids.len().saturating_sub(1) {
+                // Drain remaining responses before returning error
+                let remaining = total_ids - idx - 1;
+                for _ in 0..remaining {
                     let _ = Self::read_packet(&mut *r);
                 }
                 return Err(SftpError::Status(code, msg));
