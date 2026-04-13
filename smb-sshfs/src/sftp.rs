@@ -618,6 +618,61 @@ impl SftpSession {
     }
 
     pub fn read(&self, handle: &[u8], offset: u64, len: u32) -> SftpResult<Vec<u8>> {
+        // Pipeline multiple 256KB reads to saturate the network.
+        let total = len as u64;
+        if total <= MAX_READ_SIZE as u64 {
+            return self.read_single(handle, offset, len);
+        }
+
+        let mut result = Vec::with_capacity(total as usize);
+        let mut cur_offset = offset;
+        let end = offset + total;
+
+        // Send all read requests up front (pipeline)
+        let mut ids = Vec::new();
+        {
+            let mut w = self.writer.lock().map_err(|_| SftpError::Disconnected)?;
+            while cur_offset < end {
+                let chunk = ((end - cur_offset) as u32).min(MAX_READ_SIZE);
+                let id = self.next_id();
+                let mut buf = Buf::new();
+                buf.put_bytes(handle);
+                buf.put_u64(cur_offset);
+                buf.put_u32(chunk);
+                Self::write_packet(&mut *w, SSH_FXP_READ, id, &buf.0)?;
+                ids.push(id);
+                cur_offset += chunk as u64;
+            }
+            w.flush().map_err(|_| SftpError::Disconnected)?;
+        }
+
+        // Collect responses in order
+        let mut r = self.reader.lock().map_err(|_| SftpError::Disconnected)?;
+        for _expected_id in &ids {
+            let (t, data) = Self::read_packet(&mut *r)?;
+            if t == SSH_FXP_STATUS {
+                let mut sr = Reader::new(&data[4..]);
+                let code = sr.get_u32()?;
+                if code == SSH_FX_EOF {
+                    break; // partial read is OK
+                }
+                let msg = sr.get_string().unwrap_or_default();
+                return Err(SftpError::Status(code, msg));
+            }
+            if t != SSH_FXP_DATA {
+                return Err(SftpError::Protocol(format!("expected DATA, got {t}")));
+            }
+            let chunk = Reader::new(&data[4..]).get_bytes()?;
+            if chunk.is_empty() {
+                break;
+            }
+            result.extend_from_slice(&chunk);
+        }
+
+        Ok(result)
+    }
+
+    fn read_single(&self, handle: &[u8], offset: u64, len: u32) -> SftpResult<Vec<u8>> {
         let len = len.min(MAX_READ_SIZE);
         let mut buf = Buf::new();
         buf.put_bytes(handle);

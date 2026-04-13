@@ -138,7 +138,58 @@ impl AttrCache {
     }
 }
 
+// ── Directory listing cache (session-level) ─────────────────────────
+// macOS sends per-file CREATE+QUERY_DIRECTORY+CLOSE compounds for stat
+// lookups.  Without this cache, each compound triggers a full SFTP readdir.
+
+const DIR_CACHE_TTL_SECS: u64 = 15;
+
+struct CachedDir {
+    entries: Vec<DirEntry>,
+    expires: Instant,
+}
+
+struct DirCache {
+    dirs: HashMap<String, CachedDir>,
+}
+
+impl DirCache {
+    fn new() -> Self {
+        DirCache { dirs: HashMap::new() }
+    }
+
+    fn get(&self, path: &str) -> Option<&Vec<DirEntry>> {
+        self.dirs.get(path).and_then(|c| {
+            if c.expires > Instant::now() {
+                Some(&c.entries)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn insert(&mut self, path: String, entries: Vec<DirEntry>) {
+        self.dirs.insert(path, CachedDir {
+            entries,
+            expires: Instant::now() + std::time::Duration::from_secs(DIR_CACHE_TTL_SECS),
+        });
+    }
+
+    fn invalidate(&mut self, path: &str) {
+        self.dirs.remove(path);
+    }
+}
+
 // ── Open file/dir handles ───────────────────────────────────────────
+
+/// Read cache: cache each SFTP read so small follow-up reads (macOS
+/// sends 2KB resource-fork probes after each 512KB read) are served
+/// without an extra SFTP round-trip.
+
+struct ReadAhead {
+    data: Vec<u8>,
+    offset: u64,  // start offset of buffered data
+}
 
 struct OpenHandle {
     sftp_handle: Option<Vec<u8>>, // None for directories
@@ -146,6 +197,7 @@ struct OpenHandle {
     is_dir: bool,
     dir_entries: Option<Vec<DirEntry>>, // cached readdir result
     dir_offset: usize,
+    readahead: Option<ReadAhead>,
 }
 
 // ── SMB2 Server Session ─────────────────────────────────────────────
@@ -159,6 +211,7 @@ pub struct SmbSession {
     handles: HashMap<u64, OpenHandle>,
     next_handle: u64,
     cache: AttrCache,
+    dir_cache: DirCache,
     auth_phase: u8,
     /// Last handle created — used for related compound requests where
     /// QUERY_INFO/CLOSE reference FileId=0xFFFFFFFF meaning "use CREATE's handle."
@@ -176,6 +229,7 @@ impl SmbSession {
             handles: HashMap::new(),
             next_handle: 1,
             cache: AttrCache::new(),
+            dir_cache: DirCache::new(),
             auth_phase: 0,
             last_create_handle: 0,
         }
@@ -187,6 +241,14 @@ impl SmbSession {
             self.last_create_handle
         } else {
             fid
+        }
+    }
+
+    /// Invalidate all caches for a path (attr + parent dir listing).
+    fn invalidate_path(&mut self, path: &str) {
+        self.cache.invalidate(path);
+        if let Some((parent, _)) = path.rsplit_once('/') {
+            self.dir_cache.invalidate(parent);
         }
     }
 
@@ -525,7 +587,7 @@ impl SmbSession {
                                 self.error_response(hdr, STATUS_ACCESS_DENIED, out);
                                 return;
                             }
-                            self.cache.invalidate(&path);
+                            self.invalidate_path(&path);
                             match self.stat_cached(&path) {
                                 Ok((attr, is_dir)) => {
                                     self.respond_create_success(hdr, &path, &attr, is_dir, out);
@@ -539,7 +601,7 @@ impl SmbSession {
                             {
                                 Ok(sftp_handle) => {
                                     let _ = self.sftp.close(&sftp_handle);
-                                    self.cache.invalidate(&path);
+                                    self.invalidate_path(&path);
                                     match self.stat_cached(&path) {
                                         Ok((attr, is_dir)) => {
                                             self.respond_create_success(
@@ -580,7 +642,7 @@ impl SmbSession {
                         }
                     }
                 }
-                self.cache.invalidate(&path);
+                self.invalidate_path(&path);
                 match self.stat_cached(&path) {
                     Ok((attr, is_dir)) => {
                         self.respond_create_success(hdr, &path, &attr, is_dir, out);
@@ -602,7 +664,7 @@ impl SmbSession {
                         return;
                     }
                 }
-                self.cache.invalidate(&path);
+                self.invalidate_path(&path);
                 match self.stat_cached(&path) {
                     Ok((attr, is_dir)) => {
                         self.respond_create_success(hdr, &path, &attr, is_dir, out);
@@ -632,6 +694,7 @@ impl SmbSession {
                 is_dir,
                 dir_entries: None,
                 dir_offset: 0,
+                readahead: None,
             },
         );
 
@@ -701,7 +764,7 @@ impl SmbSession {
             self.error_response(hdr, STATUS_INVALID_PARAMETER, out);
             return;
         }
-        let length = read_u32_le(body, 4);
+        let length = read_u32_le(body, 4) as u64;
         let offset = read_u64_le(body, 8);
         let fid = self.resolve_fid(read_u64_le(body, 16));
 
@@ -716,7 +779,6 @@ impl SmbSession {
         // Lazy-open SFTP handle
         if handle.sftp_handle.is_none() {
             match self.sftp.open(&handle.path, 0x01, 0) {
-                // READ
                 Ok(h) => handle.sftp_handle = Some(h),
                 Err(_) => {
                     self.error_response(hdr, STATUS_ACCESS_DENIED, out);
@@ -725,29 +787,49 @@ impl SmbSession {
             }
         }
 
+        // Try to serve from read-ahead buffer first
+        if let Some(ref ra) = handle.readahead {
+            if offset >= ra.offset && offset + length <= ra.offset + ra.data.len() as u64 {
+                let start = (offset - ra.offset) as usize;
+                let end = start + length as usize;
+                let data = &ra.data[start..end];
+                Self::write_read_response(hdr, data, out);
+                return;
+            }
+        }
+
+        // Read from SFTP — cache result for small follow-up reads
         let sftp_h = handle.sftp_handle.as_ref().map(|h| h.clone());
         match sftp_h {
-            Some(ref h) => match self.sftp.read(h, offset, length) {
+            Some(ref h) => match self.sftp.read(h, offset, length as u32) {
                 Ok(data) if data.is_empty() => {
                     self.error_response(hdr, STATUS_END_OF_FILE, out);
                 }
                 Ok(data) => {
-                    let data_offset = SMB2_HEADER_SIZE as u16 + 16;
-                    let mut resp = Vec::with_capacity(16 + data.len());
-                    resp.extend_from_slice(&17u16.to_le_bytes()); // StructureSize
-                    resp.extend_from_slice(&data_offset.to_le_bytes()); // DataOffset (from header start)
-                    resp.extend_from_slice(&(data.len() as u32).to_le_bytes()); // DataLength
-                    resp.extend_from_slice(&0u32.to_le_bytes()); // DataRemaining
-                    resp.extend_from_slice(&0u32.to_le_bytes()); // Reserved2
-                                                                 // Padding to align data
-                    resp.push(0);
-                    resp.extend_from_slice(&data);
-                    hdr.write_response(STATUS_SUCCESS, &resp, out);
+                    let respond_len = (length as usize).min(data.len());
+                    Self::write_read_response(hdr, &data[..respond_len], out);
+                    // Cache for small follow-up reads
+                    if let Some(h) = self.handles.get_mut(&fid) {
+                        h.readahead = Some(ReadAhead { data, offset });
+                    }
                 }
                 Err(_) => self.error_response(hdr, STATUS_ACCESS_DENIED, out),
             },
             None => self.error_response(hdr, STATUS_INVALID_PARAMETER, out),
         }
+    }
+
+    fn write_read_response(hdr: &Smb2Header, data: &[u8], out: &mut Vec<u8>) {
+        let data_offset = SMB2_HEADER_SIZE as u16 + 16;
+        let mut resp = Vec::with_capacity(16 + data.len());
+        resp.extend_from_slice(&17u16.to_le_bytes()); // StructureSize
+        resp.extend_from_slice(&data_offset.to_le_bytes()); // DataOffset
+        resp.extend_from_slice(&(data.len() as u32).to_le_bytes()); // DataLength
+        resp.extend_from_slice(&0u32.to_le_bytes()); // DataRemaining
+        resp.extend_from_slice(&0u32.to_le_bytes()); // Reserved2
+        resp.push(0); // Padding
+        resp.extend_from_slice(data);
+        hdr.write_response(STATUS_SUCCESS, &resp, out);
     }
 
     // ── WRITE ───────────────────────────────────────────────────────
@@ -790,10 +872,11 @@ impl SmbSession {
         }
 
         let sftp_h = handle.sftp_handle.as_ref().map(|h| h.clone());
+        let write_path = handle.path.clone();
         match sftp_h {
             Some(ref h) => match self.sftp.write(h, offset, data) {
                 Ok(()) => {
-                    self.cache.invalidate(&handle.path);
+                    self.invalidate_path(&write_path);
                     let mut resp = Vec::with_capacity(16);
                     resp.extend_from_slice(&17u16.to_le_bytes()); // StructureSize
                     resp.extend_from_slice(&0u16.to_le_bytes()); // Reserved
@@ -846,18 +929,27 @@ impl SmbSession {
             }
         };
 
-        // Fetch directory listing if not cached
+        // Fetch directory listing — check session-level dir cache first,
+        // then per-handle cache, then fall back to SFTP readdir.
         if handle.dir_entries.is_none() || restart {
-            match self.sftp.readdir(&handle.path) {
-                Ok(entries) => {
-                    // Cache attrs for all entries
-                    self.cache.insert_dir_entries(&handle.path, &entries);
-                    handle.dir_entries = Some(entries);
-                    handle.dir_offset = 0;
-                }
-                Err(_) => {
-                    self.error_response(hdr, STATUS_ACCESS_DENIED, out);
-                    return;
+            let dir_path = handle.path.clone();
+            if let Some(cached) = self.dir_cache.get(&dir_path) {
+                log::debug!("QUERY_DIRECTORY: dir cache hit for {dir_path}");
+                handle.dir_entries = Some(cached.clone());
+                if restart { handle.dir_offset = 0; }
+            } else {
+                match self.sftp.readdir(&dir_path) {
+                    Ok(entries) => {
+                        // Populate both caches
+                        self.cache.insert_dir_entries(&dir_path, &entries);
+                        self.dir_cache.insert(dir_path, entries.clone());
+                        handle.dir_entries = Some(entries);
+                        handle.dir_offset = 0;
+                    }
+                    Err(_) => {
+                        self.error_response(hdr, STATUS_ACCESS_DENIED, out);
+                        return;
+                    }
                 }
             }
         }
@@ -895,8 +987,8 @@ impl SmbSession {
         // Build directory info response
         // Build directory entries. Track entry start positions for NextEntryOffset patching.
         let single_entry = flags & 0x02 != 0; // RETURN_SINGLE_ENTRY
-        let mut dir_data = Vec::with_capacity(4096);
-        let max_entries = if single_entry { 1 } else { 64 };
+        let mut dir_data = Vec::with_capacity(if single_entry { 256 } else { filtered.len() * 128 });
+        let max_entries = if single_entry { 1 } else { usize::MAX };
         let mut count = 0;
         let mut entry_starts: Vec<usize> = Vec::new();
 
@@ -1199,8 +1291,8 @@ impl SmbSession {
 
                 match self.sftp.rename(&path, &new_path) {
                     Ok(()) => {
-                        self.cache.invalidate(&path);
-                        self.cache.invalidate(&new_path);
+                        self.invalidate_path(&path);
+                        self.invalidate_path(&new_path);
                         // Update handle path
                         if let Some(h) = self.handles.get_mut(&fid) {
                             h.path = new_path;
@@ -1243,7 +1335,7 @@ impl SmbSession {
                             attr.mtime = filetime_to_unix(new_mtime) as u32;
                         }
                         let _ = self.sftp.setstat(&path, &attr);
-                        self.cache.invalidate(&path);
+                        self.invalidate_path(&path);
                     }
                 }
             }
