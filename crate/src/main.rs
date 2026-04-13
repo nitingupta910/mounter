@@ -343,9 +343,9 @@ fn is_macos() -> bool {
 
 fn mount_cmd_hint(port: u16, name: &str) -> String {
     if is_macos() {
-        format!("mount_smbfs //guest@localhost:{port}/{name} ~/mnt/{name}")
+        format!("mount_smbfs //guest@localhost:{port}/{name} <mountpoint>")
     } else {
-        format!("sudo mount -t cifs //127.0.0.1/{name} ~/mnt/{name} -o guest,vers=2.0,port={port}")
+        format!("gio mount smb://guest@127.0.0.1:{port}/{name}")
     }
 }
 
@@ -364,29 +364,12 @@ fn spawn_mount(port: u16, name: &str, mount_point: &str) {
                 .map(|s| s.success())
                 .unwrap_or(false)
         } else {
-            // Linux: try mount -t cifs (needs root), fall back to gio mount
-            let cifs_ok = Command::new("sudo")
-                .args([
-                    "mount",
-                    "-t",
-                    "cifs",
-                    &format!("//127.0.0.1/{name}"),
-                    &mp,
-                    "-o",
-                    &format!("guest,vers=2.0,port={port}"),
-                ])
+            // Linux: gio mount (userspace SMB, no root needed)
+            Command::new("gio")
+                .args(["mount", &format!("smb://guest@127.0.0.1:{port}/{name}")])
                 .status()
                 .map(|s| s.success())
-                .unwrap_or(false);
-            if cifs_ok {
-                true
-            } else {
-                Command::new("gio")
-                    .args(["mount", &format!("smb://guest@localhost:{port}/{name}")])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-            }
+                .unwrap_or(false)
         };
 
         if ok {
@@ -400,51 +383,13 @@ fn spawn_mount(port: u16, name: &str, mount_point: &str) {
     });
 }
 
-/// Unmount a path with platform-appropriate escalation.
-fn do_unmount(path: &str) {
-    // Strategy 1: umount (works on both platforms)
-    if Command::new("umount")
-        .arg(path)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        return;
-    }
-
-    if is_macos() {
-        // macOS strategy 2: diskutil
-        if Command::new("diskutil")
-            .args(["unmount", "force", path])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
-    } else {
-        // Linux strategy 2: lazy unmount
-        if Command::new("umount")
-            .args(["-l", path])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
-    }
-
-    eprintln!("Warning: could not unmount {path}");
-}
-
 // ── Subcommands ─────────────────────────────────────────────────────
 
 /// An active mounter mount parsed from `mount` output.
 struct MountInfo {
-    share: String,  // e.g. "myserver"
-    port: u16,      // localhost port
-    path: String,   // mount point, e.g. /Users/x/mnt/myserver
-    source: String, // full source, e.g. //guest:@localhost:44445/myserver
+    share: String, // e.g. "myserver"
+    port: u16,     // localhost port
+    path: String,  // mount point, e.g. /Users/x/mnt/myserver
 }
 
 /// Parse `mount` output to find our SMB mounts (guest@localhost).
@@ -456,11 +401,11 @@ fn find_smb_mounts() -> Vec<MountInfo> {
     let mut mounts = Vec::new();
     for line in output.lines() {
         // macOS: //guest:@localhost:44445/name on /Users/x/mnt/name (smbfs, ...)
-        // Linux: //localhost/name on /home/x/mnt/name type cifs (...)
+        // Linux: //localhost:port/name on /path type smb (via gio/gvfs)
         if !line.contains("localhost") {
             continue;
         }
-        if !line.contains("smbfs") && !line.contains("cifs") {
+        if !line.contains("smbfs") && !line.contains("smb") {
             continue;
         }
         let parts: Vec<&str> = line.splitn(4, ' ').collect();
@@ -483,7 +428,6 @@ fn find_smb_mounts() -> Vec<MountInfo> {
                             share: share.to_string(),
                             port,
                             path: path.to_string(),
-                            source: source.to_string(),
                         });
                     }
                 }
