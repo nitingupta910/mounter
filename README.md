@@ -4,30 +4,26 @@ Mount remote SSH directories in your file manager. No FUSE, no Docker, no kernel
 
 Works on macOS and Linux.
 
+## Install
+
+```bash
+cargo install mounter
+```
+
 ## Quick start
 
 ```bash
-cd smb-sshfs
-cargo build --release
-
-# One command: mount, serve, Ctrl-C to stop
-./target/release/smb-sshfs mount user@server:/path
+mounter mount user@server:/path
 ```
 
-Or start the server and mount separately:
-
-```bash
-./target/release/smb-sshfs user@server:/path          # prints mount command
-mount_smbfs //guest@localhost:<port>/server ~/mnt/server   # macOS
-```
+That's it. Files appear at `~/mnt/server`. Press Ctrl-C to stop.
 
 ## Commands
 
 ```
-smb-sshfs mount [user@]host:[path] [opts]   Mount and serve (Ctrl-C to stop)
-smb-sshfs [user@]host:[path] [opts]         Start SMB server only
-smb-sshfs unmount <name|path|all>            Unmount cleanly (handles busy mounts)
-smb-sshfs list                               Show active mounts
+mounter mount [user@]host:[path] [opts]   Mount and serve (Ctrl-C to stop)
+mounter unmount <name|path|all>            Unmount cleanly (handles busy mounts)
+mounter list                               Show active mounts
 ```
 
 Options:
@@ -42,12 +38,12 @@ Options:
 ## How it works
 
 ```
-File manager <--SMB2--> smb-sshfs (localhost) <--SFTP/SSH--> remote server
+File manager <--SMB2--> mounter (localhost) <--SFTP/SSH--> remote server
 ```
 
-`smb-sshfs` is a single Rust binary that speaks SMB2 to your OS and SFTP v3 to
-the remote. It spawns `ssh -s sftp` as a subprocess — existing SSH keys,
-config, and agent just work. No kernel extensions, no privileged containers.
+A single Rust binary that speaks SMB2 to your OS and SFTP v3 to the remote.
+It spawns `ssh -s sftp` as a subprocess — existing SSH keys, config, and
+agent just work. No kernel extensions, no privileged containers.
 
 ## Platform support
 
@@ -56,10 +52,6 @@ config, and agent just work. No kernel extensions, no privileged containers.
 | macOS | `mount_smbfs` (built-in) | Full support |
 | Linux | `smbclient` / userspace tools | Works |
 | Linux | `mount -t cifs` (kernel) | Needs NTLMSSP improvements |
-
-On Linux, the SMB2 server works — `smbclient` can list and read files. The
-kernel `mount.cifs` driver requires stricter NTLMSSP authentication than
-macOS's client; this is being worked on.
 
 ## Performance
 
@@ -87,11 +79,11 @@ Key optimizations:
 
 - macOS or Linux
 - SSH key auth to your remote server
-- Rust toolchain (to build)
 
-## Tests and benchmarks
+## Development
 
 ```bash
+cd smb-sshfs
 cargo test          # 54 unit tests
 cargo bench         # criterion benchmarks for hot paths
 ```
