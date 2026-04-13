@@ -41,7 +41,9 @@ fn wildcard_match(p: &[char], n: &[char], pi: usize, ni: usize) -> bool {
             }
         }
         false
-    } else if ni < n.len() && (p[pi] == '?' || p[pi].to_ascii_lowercase() == n[ni].to_ascii_lowercase()) {
+    } else if ni < n.len()
+        && (p[pi] == '?' || p[pi].to_ascii_lowercase() == n[ni].to_ascii_lowercase())
+    {
         wildcard_match(p, n, pi + 1, ni + 1)
     } else {
         false
@@ -155,7 +157,9 @@ struct DirCache {
 
 impl DirCache {
     fn new() -> Self {
-        DirCache { dirs: HashMap::new() }
+        DirCache {
+            dirs: HashMap::new(),
+        }
     }
 
     fn get(&self, path: &str) -> Option<&Vec<DirEntry>> {
@@ -169,10 +173,13 @@ impl DirCache {
     }
 
     fn insert(&mut self, path: String, entries: Vec<DirEntry>) {
-        self.dirs.insert(path, CachedDir {
-            entries,
-            expires: Instant::now() + std::time::Duration::from_secs(DIR_CACHE_TTL_SECS),
-        });
+        self.dirs.insert(
+            path,
+            CachedDir {
+                entries,
+                expires: Instant::now() + std::time::Duration::from_secs(DIR_CACHE_TTL_SECS),
+            },
+        );
     }
 
     fn invalidate(&mut self, path: &str) {
@@ -188,7 +195,7 @@ impl DirCache {
 
 struct ReadAhead {
     data: Vec<u8>,
-    offset: u64,  // start offset of buffered data
+    offset: u64, // start offset of buffered data
 }
 
 struct OpenHandle {
@@ -446,22 +453,22 @@ impl SmbSession {
             let server_flags = (client_flags & !0x02000000) | 0x00020000; // remove VERSION, add TARGET_TYPE_SERVER
 
             let mut challenge = Vec::with_capacity(56);
-            challenge.extend_from_slice(b"NTLMSSP\0");        // 0: Signature
-            challenge.extend_from_slice(&2u32.to_le_bytes());  // 8: Type=CHALLENGE
-            // TargetName: empty (offset=48 = end of fixed fields)
-            challenge.extend_from_slice(&0u16.to_le_bytes());  // 12: TargetNameLen
-            challenge.extend_from_slice(&0u16.to_le_bytes());  // 14: TargetNameMaxLen
+            challenge.extend_from_slice(b"NTLMSSP\0"); // 0: Signature
+            challenge.extend_from_slice(&2u32.to_le_bytes()); // 8: Type=CHALLENGE
+                                                              // TargetName: empty (offset=48 = end of fixed fields)
+            challenge.extend_from_slice(&0u16.to_le_bytes()); // 12: TargetNameLen
+            challenge.extend_from_slice(&0u16.to_le_bytes()); // 14: TargetNameMaxLen
             challenge.extend_from_slice(&48u32.to_le_bytes()); // 16: TargetNameOffset
             challenge.extend_from_slice(&server_flags.to_le_bytes()); // 20: NegotiateFlags
-            // ServerChallenge (8 bytes)
+                                                                      // ServerChallenge (8 bytes)
             challenge.extend_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]); // 24
-            // Reserved (8 bytes)
+                                                                                            // Reserved (8 bytes)
             challenge.extend_from_slice(&[0u8; 8]); // 32
-            // TargetInfo: empty
-            challenge.extend_from_slice(&0u16.to_le_bytes());  // 40: TargetInfoLen
-            challenge.extend_from_slice(&0u16.to_le_bytes());  // 42: TargetInfoMaxLen
+                                                    // TargetInfo: empty
+            challenge.extend_from_slice(&0u16.to_le_bytes()); // 40: TargetInfoLen
+            challenge.extend_from_slice(&0u16.to_le_bytes()); // 42: TargetInfoMaxLen
             challenge.extend_from_slice(&48u32.to_le_bytes()); // 44: TargetInfoOffset
-            // Total: 48 bytes
+                                                               // Total: 48 bytes
 
             log::info!("NTLMSSP challenge: client_flags=0x{client_flags:08x} server_flags=0x{server_flags:08x}");
 
@@ -907,8 +914,16 @@ impl SmbSession {
         let restart = flags & 0x01 != 0; // RESTART_SCANS
 
         // Parse search pattern (MS-SMB2 2.2.33)
-        let name_offset = if body.len() >= 26 { read_u16_le(body, 24) as usize } else { 0 };
-        let name_length = if body.len() >= 28 { read_u16_le(body, 26) as usize } else { 0 };
+        let name_offset = if body.len() >= 26 {
+            read_u16_le(body, 24) as usize
+        } else {
+            0
+        };
+        let name_length = if body.len() >= 28 {
+            read_u16_le(body, 26) as usize
+        } else {
+            0
+        };
         let pattern = if name_length > 0 {
             let name_start = name_offset.saturating_sub(SMB2_HEADER_SIZE);
             if name_start + name_length <= body.len() {
@@ -936,7 +951,9 @@ impl SmbSession {
             if let Some(cached) = self.dir_cache.get(&dir_path) {
                 log::debug!("QUERY_DIRECTORY: dir cache hit for {dir_path}");
                 handle.dir_entries = Some(cached.clone());
-                if restart { handle.dir_offset = 0; }
+                if restart {
+                    handle.dir_offset = 0;
+                }
             } else {
                 match self.sftp.readdir(&dir_path) {
                     Ok(entries) => {
@@ -987,13 +1004,19 @@ impl SmbSession {
         // Build directory info response
         // Build directory entries. Track entry start positions for NextEntryOffset patching.
         let single_entry = flags & 0x02 != 0; // RETURN_SINGLE_ENTRY
-        let mut dir_data = Vec::with_capacity(if single_entry { 256 } else { filtered.len() * 128 });
+        let mut dir_data = Vec::with_capacity(if single_entry {
+            256
+        } else {
+            filtered.len() * 128
+        });
         let max_entries = if single_entry { 1 } else { usize::MAX };
         let mut count = 0;
         let mut entry_starts: Vec<usize> = Vec::new();
 
         for entry in &filtered {
-            if count >= max_entries { break; }
+            if count >= max_entries {
+                break;
+            }
             if is_wildcard {
                 handle.dir_offset += 1;
             }
@@ -1067,7 +1090,7 @@ impl SmbSession {
         resp.extend_from_slice(&9u16.to_le_bytes()); // StructureSize
         resp.extend_from_slice(&data_offset.to_le_bytes()); // OutputBufferOffset
         resp.extend_from_slice(&(dir_data.len() as u32).to_le_bytes()); // OutputBufferLength
-        // No padding — OutputBuffer starts immediately at byte 8
+                                                                        // No padding — OutputBuffer starts immediately at byte 8
         resp.extend_from_slice(&dir_data);
 
         hdr.write_response(STATUS_SUCCESS, &resp, out);
