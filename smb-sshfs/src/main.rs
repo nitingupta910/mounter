@@ -1,4 +1,4 @@
-//! smb-sshfs: Single-binary SSH mount for macOS.
+//! mounter: Single-binary SSH mount for macOS.
 //!
 //! Combines an SMB2 server + SFTP client in one process.
 //! macOS mounts via `mount_smbfs`, all file ops go directly to SSH.
@@ -17,13 +17,13 @@ use std::process;
 use std::sync::Arc;
 
 fn usage() -> ! {
-    eprintln!("smb-sshfs — mount remote SSH directories via SMB2-over-SFTP");
+    eprintln!("mounter — mount remote SSH directories via SMB2-over-SFTP");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  smb-sshfs mount [user@]host:[path] [opts]  Mount and run (Ctrl-C to unmount)");
-    eprintln!("  smb-sshfs [user@]host:[path] [opts]        Start SMB server only");
-    eprintln!("  smb-sshfs unmount <name|path|all>           Unmount cleanly");
-    eprintln!("  smb-sshfs list                              Show active mounts");
+    eprintln!("  mounter mount [user@]host:[path] [opts]  Mount and run (Ctrl-C to unmount)");
+    eprintln!("  mounter [user@]host:[path] [opts]        Start SMB server only");
+    eprintln!("  mounter unmount <name|path|all>           Unmount cleanly");
+    eprintln!("  mounter list                              Show active mounts");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -p PORT         SSH port (default: 22)");
@@ -48,7 +48,7 @@ fn main() {
     match args[1].as_str() {
         "unmount" | "umount" => {
             let target = args.get(2).map(|s| s.as_str()).unwrap_or_else(|| {
-                eprintln!("Usage: smb-sshfs unmount <name|path|all>");
+                eprintln!("Usage: mounter unmount <name|path|all>");
                 process::exit(1);
             });
             process::exit(cmd_unmount(target));
@@ -61,12 +61,12 @@ fn main() {
         _ => {}
     }
 
-    // For "mount" subcommand, shift args: smb-sshfs mount user@host:path → remote is args[2]
+    // For "mount" subcommand, shift args: mounter mount user@host:path → remote is args[2]
     let remote_idx = if auto_mount { 2 } else { 1 };
     let remote = match args.get(remote_idx) {
         Some(r) => r,
         None => {
-            eprintln!("Missing remote spec. Usage: smb-sshfs mount [user@]host:[path]");
+            eprintln!("Missing remote spec. Usage: mounter mount [user@]host:[path]");
             process::exit(1);
         }
     };
@@ -178,7 +178,7 @@ fn main() {
     if auto_mount {
         // Spawn mount in background — it will connect once accept loop starts
         spawn_mount(local_port, &name);
-        println!("Press Ctrl-C to stop. Clean up with: smb-sshfs unmount {name}");
+        println!("Press Ctrl-C to stop. Clean up with: mounter unmount {name}");
     } else {
         println!("Mount with:");
         println!("  {}", mount_cmd_hint(local_port, &name));
@@ -421,7 +421,7 @@ fn do_unmount(path: &str) {
 
 // ── Subcommands ─────────────────────────────────────────────────────
 
-/// An active smb-sshfs mount parsed from `mount` output.
+/// An active mounter mount parsed from `mount` output.
 struct MountInfo {
     share: String,  // e.g. "myserver"
     port: u16,      // localhost port
@@ -475,7 +475,7 @@ fn find_smb_mounts() -> Vec<MountInfo> {
     mounts
 }
 
-/// Kill the smb-sshfs process listening on the given port.
+/// Kill the mounter process listening on the given port.
 fn kill_server(port: u16) -> bool {
     let output = match Command::new("lsof")
         .args(["-ti", &format!(":{port}")])
@@ -488,13 +488,13 @@ fn kill_server(port: u16) -> bool {
     let mut killed = false;
     for pid_str in pids.split_whitespace() {
         if let Ok(pid) = pid_str.parse::<u32>() {
-            // Verify it's actually smb-sshfs before killing
+            // Verify it's actually mounter before killing
             if let Ok(ps) = Command::new("ps")
                 .args(["-p", &pid.to_string(), "-o", "comm="])
                 .output()
             {
                 let comm = String::from_utf8_lossy(&ps.stdout);
-                if comm.trim().contains("smb-sshfs") {
+                if comm.trim().contains("mounter") {
                     let _ = Command::new("kill").arg(pid.to_string()).status();
                     eprintln!("  killed server pid {pid}");
                     killed = true;
@@ -569,7 +569,7 @@ fn unmount_one(info: &MountInfo) -> bool {
 fn cmd_unmount(target: &str) -> i32 {
     let mounts = find_smb_mounts();
     if mounts.is_empty() {
-        eprintln!("No active smb-sshfs mounts found.");
+        eprintln!("No active mounter mounts found.");
         return 1;
     }
 
@@ -615,7 +615,7 @@ fn cmd_unmount(target: &str) -> i32 {
 fn cmd_list() {
     let mounts = find_smb_mounts();
     if mounts.is_empty() {
-        println!("No active smb-sshfs mounts.");
+        println!("No active mounter mounts.");
         return;
     }
     for m in &mounts {
