@@ -83,7 +83,7 @@ Key optimizations:
 ## Development
 
 ```bash
-cd smb-sshfs
+cd crate
 cargo test          # 54 unit tests
 cargo bench         # criterion benchmarks for hot paths
 ```
