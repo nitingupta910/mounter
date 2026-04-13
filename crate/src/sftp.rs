@@ -365,7 +365,9 @@ impl SftpSession {
             .map_err(|_| SftpError::Disconnected)?;
         let len = u32::from_be_bytes(lenbuf) as usize;
         if len == 0 || len > 512 * 1024 {
-            return Err(SftpError::Protocol(format!("bad packet length: {len}")));
+            // Bad length means the stream is irrecoverably out of sync.
+            // Treat as Disconnected so the reconnect logic kicks in.
+            return Err(SftpError::Disconnected);
         }
         let mut data = vec![0u8; len];
         r.read_exact(&mut data)
@@ -566,8 +568,13 @@ impl SftpSession {
             }
 
             if t != SSH_FXP_NAME {
+                // Stream is corrupt — drain remaining before closing
+                while pending > 0 {
+                    let _ = self.recv();
+                    pending -= 1;
+                }
                 let _ = self.close_handle(&handle);
-                return Err(SftpError::Protocol(format!("expected NAME, got {t}")));
+                return Err(SftpError::Disconnected);
             }
 
             // Parse entries from this batch (skip 4-byte id)
@@ -708,7 +715,12 @@ impl SftpSession {
                 return Err(SftpError::Status(code, msg));
             }
             if t != SSH_FXP_DATA {
-                return Err(SftpError::Protocol(format!("expected DATA, got {t}")));
+                // Stream is corrupt — drain remaining and treat as disconnect
+                let remaining = total_ids - idx - 1;
+                for _ in 0..remaining {
+                    let _ = Self::read_packet(&mut *r);
+                }
+                return Err(SftpError::Disconnected);
             }
             let chunk = Reader::new(&data[4..]).get_bytes()?;
             if chunk.is_empty() {
@@ -901,7 +913,9 @@ impl ReconnectingSftp {
             let guard = self.session.lock().map_err(|_| SftpError::Disconnected)?;
             if let Some(ref session) = *guard {
                 match op(session) {
-                    Err(SftpError::Disconnected) => {} // fall through to reconnect
+                    // Disconnected or Protocol error = stream is dead/corrupt,
+                    // reconnect to get a fresh session
+                    Err(SftpError::Disconnected) | Err(SftpError::Protocol(_)) => {}
                     result => return result,
                 }
             }

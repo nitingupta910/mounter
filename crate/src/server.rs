@@ -901,8 +901,8 @@ impl SmbSession {
                         h.readahead = Some(ReadAhead { data, offset });
                     }
                 }
-                Err(SftpError::Disconnected) => {
-                    // Handle is dead — reconnect happened, reopen and retry
+                Err(SftpError::Disconnected) | Err(SftpError::Protocol(_)) => {
+                    // Handle is dead or stream corrupt — reconnect, reopen, retry
                     self.on_reconnect();
                     match self.sftp.open(&path, SSH_FXF_READ, 0) {
                         Ok(new_h) => match self.sftp.read(&new_h, offset, length as u32) {
@@ -985,8 +985,8 @@ impl SmbSession {
         handle.readahead = None; // invalidate — data is changing
         let write_result = match sftp_h {
             Some(ref h) => match self.sftp.write(h, offset, data) {
-                Err(SftpError::Disconnected) => {
-                    // Reconnect happened, reopen handle and retry
+                Err(SftpError::Disconnected) | Err(SftpError::Protocol(_)) => {
+                    // Reconnect happened or stream corrupt, reopen handle and retry
                     self.on_reconnect();
                     match self.sftp.open(&write_path, SSH_FXF_WRITE, 0) {
                         Ok(new_h) => {
