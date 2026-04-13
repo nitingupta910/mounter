@@ -342,7 +342,7 @@ fn is_macos() -> bool {
 
 fn mount_cmd_hint(port: u16, name: &str) -> String {
     if is_macos() {
-        format!("mount_smbfs //guest@{name}.localhost:{port}/{name} <mountpoint>")
+        format!("mount_smbfs //guest@localhost:{port}/{name} <mountpoint>")
     } else {
         format!("gio mount smb://guest@127.0.0.1:{port}/{name}")
     }
@@ -358,7 +358,7 @@ fn spawn_mount(port: u16, name: &str, mount_point: &str) {
     std::thread::spawn(move || {
         let ok = if is_macos() {
             Command::new("mount_smbfs")
-                .args([&format!("//guest@{name}.localhost:{port}/{name}"), &mp])
+                .args([&format!("//guest@localhost:{port}/{name}"), &mp])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
