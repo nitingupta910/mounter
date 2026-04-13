@@ -1053,7 +1053,7 @@ impl SmbSession {
         } else {
             "*".to_string()
         };
-        log::info!("QUERY_DIRECTORY: info_level={info_level} flags=0x{flags:02x} fid={fid} restart={restart} pattern=\"{pattern}\"");
+        log::debug!("QUERY_DIRECTORY: info_level={info_level} flags=0x{flags:02x} fid={fid} restart={restart} pattern=\"{pattern}\"");
 
         let handle = match self.handles.get_mut(&fid) {
             Some(h) if h.is_dir => h,
@@ -1221,7 +1221,7 @@ impl SmbSession {
         let info_type = body[2];
         let file_info_class = body[3];
         let fid = self.resolve_fid(read_u64_le(body, 24));
-        log::info!("QUERY_INFO: type={info_type} class={file_info_class} fid={fid}");
+        log::debug!("QUERY_INFO: type={info_type} class={file_info_class} fid={fid}");
 
         let handle = match self.handles.get(&fid) {
             Some(h) => h,

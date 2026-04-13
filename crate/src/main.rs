@@ -286,7 +286,7 @@ fn main() {
                         for (i, (start, end)) in cmd_offsets.iter().enumerate() {
                             let single = &msg[*start..*end];
                             let cmd_code = smb2::read_u16_le(single, 12);
-                            log::info!(
+                            log::debug!(
                                 "  Compound[{i}]: cmd=0x{cmd_code:04x} len={}",
                                 single.len()
                             );
