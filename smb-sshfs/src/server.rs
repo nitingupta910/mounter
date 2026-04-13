@@ -787,6 +787,7 @@ impl SmbSession {
         let flags = body[3];
         let fid = self.resolve_fid(read_u64_le(body, 8));
         let restart = flags & 0x01 != 0; // RESTART_SCANS
+        log::info!("QUERY_DIRECTORY: info_level={info_level} flags=0x{flags:02x} fid={fid} restart={restart}");
 
         let handle = match self.handles.get_mut(&fid) {
             Some(h) if h.is_dir => h,
@@ -826,9 +827,12 @@ impl SmbSession {
         }
 
         // Build directory info response
+        // Build directory entries. Track entry start positions for NextEntryOffset patching.
+        let single_entry = flags & 0x02 != 0; // RETURN_SINGLE_ENTRY
         let mut dir_data = Vec::with_capacity(4096);
-        let max_entries = 64; // batch size
+        let max_entries = if single_entry { 1 } else { 64 };
         let mut count = 0;
+        let mut entry_starts: Vec<usize> = Vec::new();
 
         while handle.dir_offset < entries.len() && count < max_entries {
             let entry = &entries[handle.dir_offset];
@@ -837,95 +841,59 @@ impl SmbSession {
 
             let name_bytes = to_utf16le(&entry.name);
             let is_dir = entry.attrs.perm & 0o40000 != 0;
-            let ft = unix_to_filetime(entry.attrs.mtime as u64);
+            let ft_create = unix_to_filetime(entry.attrs.mtime as u64);
+            let ft_access = unix_to_filetime(entry.attrs.atime as u64);
+            let ft_write = unix_to_filetime(entry.attrs.mtime as u64);
             let file_attrs = if is_dir {
                 FILE_ATTRIBUTE_DIRECTORY
             } else {
                 FILE_ATTRIBUTE_ARCHIVE
             };
 
-            let entry_start = dir_data.len();
+            // Pad previous entry to 8-byte alignment before starting new one
+            if !entry_starts.is_empty() {
+                while dir_data.len() % 8 != 0 {
+                    dir_data.push(0);
+                }
+            }
 
-            // FileBothDirectoryInformation layout (most compatible)
-            dir_data.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset (patched later)
+            let entry_start = dir_data.len();
+            entry_starts.push(entry_start);
+
+            // FILE_ID_BOTH_DIRECTORY_INFORMATION (level 37) — what macOS requests.
+            // Layout per MS-FSCC 2.4.17:
+            //   NextEntryOffset(4) + FileIndex(4) + times(4*8=32) +
+            //   EndOfFile(8) + AllocationSize(8) + FileAttributes(4) +
+            //   FileNameLength(4) + EaSize(4) + ShortNameLength(1) +
+            //   Reserved1(1) + ShortName(24) + Reserved2(2) + FileId(8) +
+            //   FileName(variable)
+            // Fixed part = 104 bytes
+
+            dir_data.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset (patched)
             dir_data.extend_from_slice(&0u32.to_le_bytes()); // FileIndex
-            dir_data.extend_from_slice(&ft.to_le_bytes()); // CreationTime
-            dir_data.extend_from_slice(&ft.to_le_bytes()); // LastAccessTime
-            dir_data.extend_from_slice(&ft.to_le_bytes()); // LastWriteTime
-            dir_data.extend_from_slice(&ft.to_le_bytes()); // ChangeTime
+            dir_data.extend_from_slice(&ft_create.to_le_bytes()); // CreationTime
+            dir_data.extend_from_slice(&ft_access.to_le_bytes()); // LastAccessTime
+            dir_data.extend_from_slice(&ft_write.to_le_bytes()); // LastWriteTime
+            dir_data.extend_from_slice(&ft_write.to_le_bytes()); // ChangeTime
             dir_data.extend_from_slice(&entry.attrs.size.to_le_bytes()); // EndOfFile
             dir_data.extend_from_slice(&entry.attrs.size.to_le_bytes()); // AllocationSize
             dir_data.extend_from_slice(&file_attrs.to_le_bytes()); // FileAttributes
             dir_data.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes()); // FileNameLength
             dir_data.extend_from_slice(&0u32.to_le_bytes()); // EaSize
-
-            if info_level == FILE_BOTH_DIRECTORY_INFORMATION
-                || info_level == FILE_ID_BOTH_DIRECTORY_INFORMATION
-            {
-                dir_data.push(0); // ShortNameLength
-                dir_data.push(0); // Reserved
-                dir_data.extend_from_slice(&[0u8; 24]); // ShortName (unused)
-            }
-
-            if info_level == FILE_ID_BOTH_DIRECTORY_INFORMATION
-                || info_level == FILE_ID_FULL_DIRECTORY_INFORMATION
-            {
-                dir_data.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
-                dir_data.extend_from_slice(&(handle.dir_offset as u64).to_le_bytes());
-                // FileId
-            }
-
-            dir_data.extend_from_slice(&name_bytes);
-
-            // Align to 8 bytes
-            while dir_data.len() % 8 != 0 {
-                dir_data.push(0);
-            }
-
-            // Patch NextEntryOffset for previous entry
-            if count > 1 {
-                let _entry_len = dir_data.len() - entry_start;
-                // Find previous entry's NextEntryOffset and patch it
-                // (we need to track the previous start)
-            }
-            // Simpler: patch NextEntryOffset at entry_start
-            let _current_len = dir_data.len();
-            if handle.dir_offset < entries.len() && count < max_entries {
-                // More entries coming — set offset to point to next
-                // We'll patch this after the loop
-            }
+            dir_data.push(0); // ShortNameLength
+            dir_data.push(0); // Reserved1
+            dir_data.extend_from_slice(&[0u8; 24]); // ShortName (empty)
+            dir_data.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
+            dir_data.extend_from_slice(&(handle.dir_offset as u64).to_le_bytes()); // FileId
+            dir_data.extend_from_slice(&name_bytes); // FileName
         }
 
-        // Patch NextEntryOffset for all entries except last
-        // Re-scan the buffer to fix offsets
-        let mut pos = 0;
-        loop {
-            if pos + 4 > dir_data.len() {
-                break;
-            }
-            // Find next entry by scanning for the pattern
-            let name_len_off = pos + 60; // approximate offset to FileNameLength
-            if name_len_off + 4 > dir_data.len() {
-                break;
-            }
-            let name_len = read_u32_le(&dir_data, name_len_off) as usize;
-            // Calculate this entry's total size (varies by info level)
-            let base_size = match info_level {
-                FILE_BOTH_DIRECTORY_INFORMATION => 94,
-                FILE_ID_BOTH_DIRECTORY_INFORMATION => 104,
-                _ => 68, // FILE_FULL_DIRECTORY_INFORMATION
-            };
-            let entry_size = base_size + name_len;
-            let aligned = (entry_size + 7) & !7;
-
-            if pos + aligned >= dir_data.len() {
-                // Last entry — NextEntryOffset = 0 (already set)
-                break;
-            }
-            // Patch NextEntryOffset
-            let next_offset = aligned as u32;
-            dir_data[pos..pos + 4].copy_from_slice(&next_offset.to_le_bytes());
-            pos += aligned;
+        // Patch NextEntryOffset: each entry points to the next, last = 0
+        for i in 0..entry_starts.len().saturating_sub(1) {
+            let this_start = entry_starts[i];
+            let next_start = entry_starts[i + 1];
+            let offset = (next_start - this_start) as u32;
+            dir_data[this_start..this_start + 4].copy_from_slice(&offset.to_le_bytes());
         }
 
         if dir_data.is_empty() {
@@ -933,12 +901,13 @@ impl SmbSession {
             return;
         }
 
-        let data_offset = SMB2_HEADER_SIZE as u16 + 8;
+        // OutputBuffer starts at body byte 8 = header offset 72
+        let data_offset = (SMB2_HEADER_SIZE + 8) as u16;
         let mut resp = Vec::with_capacity(8 + dir_data.len());
         resp.extend_from_slice(&9u16.to_le_bytes()); // StructureSize
         resp.extend_from_slice(&data_offset.to_le_bytes()); // OutputBufferOffset
         resp.extend_from_slice(&(dir_data.len() as u32).to_le_bytes()); // OutputBufferLength
-        resp.push(0); // Padding
+        // No padding — OutputBuffer starts immediately at byte 8
         resp.extend_from_slice(&dir_data);
 
         hdr.write_response(STATUS_SUCCESS, &resp, out);
@@ -1107,12 +1076,11 @@ impl SmbSession {
             }
         }
 
-        let data_offset = SMB2_HEADER_SIZE as u16 + 8;
+        let data_offset = (SMB2_HEADER_SIZE + 8) as u16;
         let mut resp = Vec::with_capacity(8 + info_data.len());
         resp.extend_from_slice(&9u16.to_le_bytes()); // StructureSize
         resp.extend_from_slice(&data_offset.to_le_bytes()); // OutputBufferOffset
         resp.extend_from_slice(&(info_data.len() as u32).to_le_bytes()); // OutputBufferLength
-        resp.push(0); // Padding
         resp.extend_from_slice(&info_data);
 
         hdr.write_response(STATUS_SUCCESS, &resp, out);
