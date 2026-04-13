@@ -2,13 +2,14 @@
 //!
 //! Spawns `ssh -s sftp` and speaks the binary SFTP protocol over pipes.
 //! No SSH library needed — uses the system's ssh binary (keys, config, agent all work).
+#![allow(dead_code)]
 
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // ── SFTP protocol constants ──────────────────────────────────────────
 

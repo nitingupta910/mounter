@@ -1,7 +1,7 @@
 [package]
 name = "mounter"
-version = "0.2.5"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
 description = "Mount remote SSH directories via SMB2-over-SFTP. No FUSE, no Docker, no sudo."
 license = "Apache-2.0"
 repository = "https://github.com/nitingupta910/mounter"

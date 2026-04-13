@@ -5,8 +5,8 @@
 //!
 //! Run with: cargo bench
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use mounter::server::{is_apple_metadata, smb_pattern_match, AttrCache, DirCache};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use mounter::server::{AttrCache, DirCache, is_apple_metadata, smb_pattern_match};
 use mounter::sftp::{DirEntry, FileAttr};
 use mounter::smb2::{filetime_to_unix, from_utf16le, to_utf16le, unix_to_filetime};
 

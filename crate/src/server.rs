@@ -5,8 +5,8 @@
 //! CREATE, CLOSE, READ, WRITE, QUERY_DIRECTORY, QUERY_INFO, SET_INFO.
 
 use crate::sftp::{
-    DirEntry, FileAttr, ReconnectingSftp, SftpError, SftpSession, SSH_FXF_CREAT, SSH_FXF_READ,
-    SSH_FXF_TRUNC, SSH_FXF_WRITE,
+    DirEntry, FileAttr, ReconnectingSftp, SSH_FXF_CREAT, SSH_FXF_READ, SSH_FXF_TRUNC,
+    SSH_FXF_WRITE, SftpError,
 };
 use crate::smb2::*;
 use std::collections::HashMap;
@@ -533,23 +533,25 @@ impl SmbSession {
                 Vec::with_capacity(48 + target_name_utf16.len() + target_info.len());
             challenge.extend_from_slice(b"NTLMSSP\0"); // 0: Signature
             challenge.extend_from_slice(&2u32.to_le_bytes()); // 8: Type=CHALLENGE
-                                                              // TargetName fields
+            // TargetName fields
             challenge.extend_from_slice(&(target_name_utf16.len() as u16).to_le_bytes()); // 12
             challenge.extend_from_slice(&(target_name_utf16.len() as u16).to_le_bytes()); // 14
             challenge.extend_from_slice(&target_name_offset.to_le_bytes()); // 16
             challenge.extend_from_slice(&server_flags.to_le_bytes()); // 20: NegotiateFlags
-                                                                      // ServerChallenge (8 bytes)
+            // ServerChallenge (8 bytes)
             challenge.extend_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]); // 24
             challenge.extend_from_slice(&[0u8; 8]); // 32: Reserved
-                                                    // TargetInfo fields
+            // TargetInfo fields
             challenge.extend_from_slice(&(target_info.len() as u16).to_le_bytes()); // 40
             challenge.extend_from_slice(&(target_info.len() as u16).to_le_bytes()); // 42
             challenge.extend_from_slice(&target_info_offset.to_le_bytes()); // 44
-                                                                            // Payload: TargetName + TargetInfo
+            // Payload: TargetName + TargetInfo
             challenge.extend_from_slice(&target_name_utf16);
             challenge.extend_from_slice(&target_info);
 
-            log::info!("NTLMSSP challenge: client_flags=0x{client_flags:08x} server_flags=0x{server_flags:08x}");
+            log::info!(
+                "NTLMSSP challenge: client_flags=0x{client_flags:08x} server_flags=0x{server_flags:08x}"
+            );
 
             // Wrap in SPNEGO negTokenResp
             let spnego = wrap_ntlmssp_in_spnego(&challenge);
@@ -808,15 +810,18 @@ impl SmbSession {
         resp.extend_from_slice(&attr.size.to_le_bytes()); // EndOfFile
         resp.extend_from_slice(&file_attrs.to_le_bytes()); // FileAttributes
         resp.extend_from_slice(&0u32.to_le_bytes()); // Reserved2
-                                                     // FileId: persistent (8) + volatile (8)
+        // FileId: persistent (8) + volatile (8)
         resp.extend_from_slice(&handle_id.to_le_bytes()); // FileId.Persistent
         resp.extend_from_slice(&handle_id.to_le_bytes()); // FileId.Volatile
-                                                          // CreateContexts
+        // CreateContexts
         resp.extend_from_slice(&0u32.to_le_bytes()); // CreateContextsOffset
         resp.extend_from_slice(&0u32.to_le_bytes()); // CreateContextsLength
         resp.push(0); // 1-byte variable part padding (StructureSize=89 means 88 fixed + 1)
 
-        log::debug!("CREATE OK: path={path} is_dir={is_dir} file_attrs=0x{file_attrs:08x} size={} handle={handle_id}", attr.size);
+        log::debug!(
+            "CREATE OK: path={path} is_dir={is_dir} file_attrs=0x{file_attrs:08x} size={} handle={handle_id}",
+            attr.size
+        );
         hdr.write_response(STATUS_SUCCESS, &resp, out);
     }
 
@@ -1054,7 +1059,9 @@ impl SmbSession {
         } else {
             "*".to_string()
         };
-        log::debug!("QUERY_DIRECTORY: info_level={info_level} flags=0x{flags:02x} fid={fid} restart={restart} pattern=\"{pattern}\"");
+        log::debug!(
+            "QUERY_DIRECTORY: info_level={info_level} flags=0x{flags:02x} fid={fid} restart={restart} pattern=\"{pattern}\""
+        );
 
         let handle = match self.handles.get_mut(&fid) {
             Some(h) if h.is_dir => h,
@@ -1206,7 +1213,7 @@ impl SmbSession {
         resp.extend_from_slice(&9u16.to_le_bytes()); // StructureSize
         resp.extend_from_slice(&data_offset.to_le_bytes()); // OutputBufferOffset
         resp.extend_from_slice(&(dir_data.len() as u32).to_le_bytes()); // OutputBufferLength
-                                                                        // No padding — OutputBuffer starts immediately at byte 8
+        // No padding — OutputBuffer starts immediately at byte 8
         resp.extend_from_slice(&dir_data);
 
         hdr.write_response(STATUS_SUCCESS, &resp, out);
@@ -1303,7 +1310,7 @@ impl SmbSession {
                 info_data.extend_from_slice(&ft.to_le_bytes());
                 info_data.extend_from_slice(&file_attrs.to_le_bytes());
                 info_data.extend_from_slice(&0u32.to_le_bytes()); // Reserved
-                                                                  // StandardInformation
+                // StandardInformation
                 info_data.extend_from_slice(&attr.size.to_le_bytes());
                 info_data.extend_from_slice(&attr.size.to_le_bytes());
                 info_data.extend_from_slice(&1u32.to_le_bytes());
