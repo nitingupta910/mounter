@@ -470,26 +470,66 @@ impl SmbSession {
                 })
                 .unwrap_or(0xe2088233);
 
-            // Build NTLMSSP_CHALLENGE echoing client flags (except VERSION)
-            let server_flags = (client_flags & !0x02000000) | 0x00020000; // remove VERSION, add TARGET_TYPE_SERVER
+            // Build NTLMSSP_CHALLENGE with TargetInfo (required by Linux CIFS).
+            // Flags: echo client flags, remove VERSION, add TARGET_TYPE_SERVER + TARGET_INFO.
+            let server_flags = (client_flags & !0x02000000) | 0x00020000 | 0x00800000;
 
-            let mut challenge = Vec::with_capacity(56);
+            // Build TargetInfo AV_PAIRs (required by Linux kernel CIFS driver)
+            let target_name_utf16 = to_utf16le("SSHFS");
+            let mut target_info = Vec::with_capacity(64);
+            // MsvAvNbDomainName (2) = "SSHFS"
+            target_info.extend_from_slice(&2u16.to_le_bytes());
+            target_info.extend_from_slice(&(target_name_utf16.len() as u16).to_le_bytes());
+            target_info.extend_from_slice(&target_name_utf16);
+            // MsvAvNbComputerName (1) = "SSHFS"
+            target_info.extend_from_slice(&1u16.to_le_bytes());
+            target_info.extend_from_slice(&(target_name_utf16.len() as u16).to_le_bytes());
+            target_info.extend_from_slice(&target_name_utf16);
+            // MsvAvDnsDomainName (4) = ""
+            target_info.extend_from_slice(&4u16.to_le_bytes());
+            target_info.extend_from_slice(&0u16.to_le_bytes());
+            // MsvAvDnsComputerName (3) = "sshfs"
+            let dns_name = to_utf16le("sshfs");
+            target_info.extend_from_slice(&3u16.to_le_bytes());
+            target_info.extend_from_slice(&(dns_name.len() as u16).to_le_bytes());
+            target_info.extend_from_slice(&dns_name);
+            // MsvAvTimestamp (7) = current FILETIME
+            let now_ft = unix_to_filetime(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+            target_info.extend_from_slice(&7u16.to_le_bytes());
+            target_info.extend_from_slice(&8u16.to_le_bytes());
+            target_info.extend_from_slice(&now_ft.to_le_bytes());
+            // MsvAvEOL (0) — terminator
+            target_info.extend_from_slice(&0u16.to_le_bytes());
+            target_info.extend_from_slice(&0u16.to_le_bytes());
+
+            // Fixed header is 48 bytes, TargetName starts at 48, TargetInfo after that
+            let target_name_offset = 48u32;
+            let target_info_offset = target_name_offset + target_name_utf16.len() as u32;
+
+            let mut challenge =
+                Vec::with_capacity(48 + target_name_utf16.len() + target_info.len());
             challenge.extend_from_slice(b"NTLMSSP\0"); // 0: Signature
             challenge.extend_from_slice(&2u32.to_le_bytes()); // 8: Type=CHALLENGE
-                                                              // TargetName: empty (offset=48 = end of fixed fields)
-            challenge.extend_from_slice(&0u16.to_le_bytes()); // 12: TargetNameLen
-            challenge.extend_from_slice(&0u16.to_le_bytes()); // 14: TargetNameMaxLen
-            challenge.extend_from_slice(&48u32.to_le_bytes()); // 16: TargetNameOffset
+                                                              // TargetName fields
+            challenge.extend_from_slice(&(target_name_utf16.len() as u16).to_le_bytes()); // 12
+            challenge.extend_from_slice(&(target_name_utf16.len() as u16).to_le_bytes()); // 14
+            challenge.extend_from_slice(&target_name_offset.to_le_bytes()); // 16
             challenge.extend_from_slice(&server_flags.to_le_bytes()); // 20: NegotiateFlags
                                                                       // ServerChallenge (8 bytes)
             challenge.extend_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]); // 24
-                                                                                            // Reserved (8 bytes)
-            challenge.extend_from_slice(&[0u8; 8]); // 32
-                                                    // TargetInfo: empty
-            challenge.extend_from_slice(&0u16.to_le_bytes()); // 40: TargetInfoLen
-            challenge.extend_from_slice(&0u16.to_le_bytes()); // 42: TargetInfoMaxLen
-            challenge.extend_from_slice(&48u32.to_le_bytes()); // 44: TargetInfoOffset
-                                                               // Total: 48 bytes
+            challenge.extend_from_slice(&[0u8; 8]); // 32: Reserved
+                                                    // TargetInfo fields
+            challenge.extend_from_slice(&(target_info.len() as u16).to_le_bytes()); // 40
+            challenge.extend_from_slice(&(target_info.len() as u16).to_le_bytes()); // 42
+            challenge.extend_from_slice(&target_info_offset.to_le_bytes()); // 44
+                                                                            // Payload: TargetName + TargetInfo
+            challenge.extend_from_slice(&target_name_utf16);
+            challenge.extend_from_slice(&target_info);
 
             log::info!("NTLMSSP challenge: client_flags=0x{client_flags:08x} server_flags=0x{server_flags:08x}");
 
