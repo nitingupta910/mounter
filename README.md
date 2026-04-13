@@ -13,15 +13,15 @@ cargo install mounter
 ## Quick start
 
 ```bash
-mounter mount user@server:/path
+mounter mount user@server:/path ~/mnt/server
 ```
 
-That's it. Files appear at `~/mnt/server`. Press Ctrl-C to stop.
+That's it. Press Ctrl-C to stop.
 
 ## Commands
 
 ```
-mounter mount [user@]host:[path] [opts]   Mount and serve (Ctrl-C to stop)
+mounter mount [user@]host:[path] <mountpoint> [opts]   Mount and serve
 mounter unmount <name|path|all>            Unmount cleanly (handles busy mounts)
 mounter list                               Show active mounts
 ```
@@ -44,14 +44,6 @@ File manager <--SMB2--> mounter (localhost) <--SFTP/SSH--> remote server
 A single Rust binary that speaks SMB2 to your OS and SFTP v3 to the remote.
 It spawns `ssh -s sftp` as a subprocess — existing SSH keys, config, and
 agent just work. No kernel extensions, no privileged containers.
-
-## Platform support
-
-| Platform | Mount method | Status |
-|----------|-------------|--------|
-| macOS | `mount_smbfs` (built-in) | Full support |
-| Linux | `smbclient` / userspace tools | Works |
-| Linux | `mount -t cifs` (kernel) | Needs NTLMSSP improvements |
 
 ## Performance
 

@@ -20,10 +20,10 @@ fn usage() -> ! {
     eprintln!("mounter — mount remote SSH directories via SMB2-over-SFTP");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  mounter mount [user@]host:[path] [opts]  Mount and run (Ctrl-C to unmount)");
-    eprintln!("  mounter [user@]host:[path] [opts]        Start SMB server only");
-    eprintln!("  mounter unmount <name|path|all>           Unmount cleanly");
-    eprintln!("  mounter list                              Show active mounts");
+    eprintln!("  mounter mount [user@]host:[path] <mountpoint> [opts]  Mount and serve");
+    eprintln!("  mounter [user@]host:[path] [opts]                     Start SMB server only");
+    eprintln!("  mounter unmount <name|path|all>                        Unmount cleanly");
+    eprintln!("  mounter list                                           Show active mounts");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -p PORT         SSH port (default: 22)");
@@ -61,16 +61,39 @@ fn main() {
         _ => {}
     }
 
-    // For "mount" subcommand, shift args: mounter mount user@host:path → remote is args[2]
+    // For "mount" subcommand: mounter mount user@host:path /mount/point [opts]
     let remote_idx = if auto_mount { 2 } else { 1 };
     let remote = match args.get(remote_idx) {
         Some(r) => r,
         None => {
-            eprintln!("Missing remote spec. Usage: mounter mount [user@]host:[path]");
+            if auto_mount {
+                eprintln!("Usage: mounter mount [user@]host:[path] <mountpoint> [opts]");
+            } else {
+                eprintln!("Usage: mounter [user@]host:[path] [opts]");
+            }
             process::exit(1);
         }
     };
-    let opt_start = remote_idx + 1;
+
+    // Mount subcommand requires a mount point as the next positional arg
+    let mount_point = if auto_mount {
+        match args.get(remote_idx + 1) {
+            Some(mp) if !mp.starts_with('-') => Some(mp.clone()),
+            _ => {
+                eprintln!(
+                    "Missing mount point. Usage: mounter mount [user@]host:[path] <mountpoint>"
+                );
+                process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let opt_start = if auto_mount {
+        remote_idx + 2
+    } else {
+        remote_idx + 1
+    };
     let mut ssh_port: u16 = 22;
     let mut identity: Option<String> = None;
     let mut share_name: Option<String> = None;
@@ -175,9 +198,8 @@ fn main() {
 
     log::info!("SMB server listening on 127.0.0.1:{local_port}");
 
-    if auto_mount {
-        // Spawn mount in background — it will connect once accept loop starts
-        spawn_mount(local_port, &name);
+    if let Some(ref mp) = mount_point {
+        spawn_mount(local_port, &name, mp);
         println!("Press Ctrl-C to stop. Clean up with: mounter unmount {name}");
     } else {
         println!("Mount with:");
@@ -329,12 +351,10 @@ fn mount_cmd_hint(port: u16, name: &str) -> String {
 
 /// Spawn the mount command in the background (non-blocking).
 /// The mount will complete once the SMB server starts accepting connections.
-fn spawn_mount(port: u16, name: &str) -> String {
-    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let mount_point = format!("{home}/mnt/{name}");
-    let _ = std::fs::create_dir_all(&mount_point);
+fn spawn_mount(port: u16, name: &str, mount_point: &str) {
+    let _ = std::fs::create_dir_all(mount_point);
 
-    let mp = mount_point.clone();
+    let mp = mount_point.to_string();
     let name = name.to_string();
     std::thread::spawn(move || {
         let ok = if is_macos() {
@@ -378,8 +398,6 @@ fn spawn_mount(port: u16, name: &str) -> String {
             );
         }
     });
-
-    mount_point
 }
 
 /// Unmount a path with platform-appropriate escalation.
