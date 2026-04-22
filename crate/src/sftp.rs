@@ -4,7 +4,7 @@
 //! No SSH library needed — uses the system's ssh binary (keys, config, agent all work).
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -62,7 +62,7 @@ pub const SSH_FXF_APPEND: u32 = 0x0000_0004;
 const SFTP_PROTO_VERSION: u32 = 3;
 const MAX_READ_SIZE: u32 = 262144; // 256KB — most servers support this
 const MAX_WRITE_SIZE: u32 = 262144;
-const READDIR_PIPELINE: usize = 8; // concurrent READDIR requests
+const READ_PIPELINE: usize = 8; // concurrent READ requests
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -538,124 +538,45 @@ impl SftpSession {
         }
         let handle = Reader::new(&data[4..]).get_bytes()?;
 
-        // Pipelined READDIR: send READDIR_PIPELINE requests at once, then read
-        // responses. Keeps the network saturated instead of waiting for each
-        // response before sending the next request.
-        let mut entries = Vec::new();
-        let mut eof = false;
-        let mut pending_order = VecDeque::new();
-        let mut pending_ids = HashSet::new();
-        let mut ready: HashMap<u32, (u8, Vec<u8>)> = HashMap::new();
-
-        // Prime the pipeline — send initial batch
-        {
-            let mut w = self.writer.lock().map_err(|_| SftpError::Disconnected)?;
-            for _ in 0..READDIR_PIPELINE {
-                let id = self.next_id();
+        // READDIR operates on mutable directory-handle state. Even though SFTP
+        // responses carry request IDs, the protocol does not guarantee a server
+        // will advance a directory stream in request-ID order, so keep READDIR
+        // serialized for correctness.
+        let result = (|| {
+            let mut entries = Vec::new();
+            loop {
                 let mut rbuf = Buf::new();
                 rbuf.put_bytes(&handle);
-                Self::write_packet(&mut *w, SSH_FXP_READDIR, id, &rbuf.0)?;
-                pending_order.push_back(id);
-                pending_ids.insert(id);
-            }
-            w.flush().map_err(|_| SftpError::Disconnected)?;
-        }
-
-        // Read responses and process them in request order so out-of-order
-        // packets cannot scramble the directory stream.
-        let mut rr = self.reader.lock().map_err(|_| SftpError::Disconnected)?;
-        while !pending_order.is_empty() {
-            while let Some(expected_id) = pending_order.front().copied() {
-                let Some((t, data)) = ready.remove(&expected_id) else {
-                    break;
-                };
-                pending_order.pop_front();
-                pending_ids.remove(&expected_id);
-
+                let (t, data) = self.request(SSH_FXP_READDIR, &rbuf.0)?;
                 if t == SSH_FXP_STATUS {
                     let mut sr = Reader::new(&data[4..]);
                     let code = sr.get_u32()?;
                     if code == SSH_FX_EOF {
-                        eof = true;
-                    } else {
-                        let msg = sr.get_string().unwrap_or_default();
-                        let unread = pending_order.len().saturating_sub(ready.len());
-                        Self::drain_packets(&mut *rr, unread);
-                        drop(rr);
-                        let _ = self.close_handle(&handle);
-                        return Err(SftpError::Status(code, msg));
+                        break;
                     }
-                } else if t == SSH_FXP_NAME {
-                    if !eof {
-                        let mut r = Reader::new(&data[4..]);
-                        let count = r.get_u32()?;
-                        for _ in 0..count {
-                            let name = r.get_string()?;
-                            let _longname = r.get_string()?;
-                            let attrs = r.get_attrs()?;
-                            if name != "." && name != ".." {
-                                entries.push(DirEntry { name, attrs });
-                            }
-                        }
-                    }
-                } else {
-                    let unread = pending_order.len().saturating_sub(ready.len());
-                    Self::drain_packets(&mut *rr, unread);
-                    drop(rr);
-                    let _ = self.close_handle(&handle);
+                    let msg = sr.get_string().unwrap_or_default();
+                    return Err(SftpError::Status(code, msg));
+                }
+                if t != SSH_FXP_NAME {
                     return Err(SftpError::Disconnected);
                 }
 
-                if !eof {
-                    let mut w = self.writer.lock().map_err(|_| SftpError::Disconnected)?;
-                    let id = self.next_id();
-                    let mut rbuf = Buf::new();
-                    rbuf.put_bytes(&handle);
-                    Self::write_packet(&mut *w, SSH_FXP_READDIR, id, &rbuf.0)?;
-                    w.flush().map_err(|_| SftpError::Disconnected)?;
-                    pending_order.push_back(id);
-                    pending_ids.insert(id);
+                let mut r = Reader::new(&data[4..]);
+                let count = r.get_u32()?;
+                for _ in 0..count {
+                    let name = r.get_string()?;
+                    let _longname = r.get_string()?;
+                    let attrs = r.get_attrs()?;
+                    if name != "." && name != ".." {
+                        entries.push(DirEntry { name, attrs });
+                    }
                 }
             }
+            Ok(entries)
+        })();
 
-            if pending_order.is_empty() {
-                break;
-            }
-
-            let (t, data) = Self::read_packet(&mut *rr)?;
-            let resp_id = match Self::response_id(&data) {
-                Ok(id) => id,
-                Err(err) => {
-                    let unread = pending_order.len().saturating_sub(ready.len() + 1);
-                    Self::drain_packets(&mut *rr, unread);
-                    drop(rr);
-                    let _ = self.close_handle(&handle);
-                    return Err(err);
-                }
-            };
-            if !pending_ids.contains(&resp_id) {
-                let unread = pending_order.len().saturating_sub(ready.len() + 1);
-                Self::drain_packets(&mut *rr, unread);
-                drop(rr);
-                let _ = self.close_handle(&handle);
-                return Err(SftpError::Protocol(format!(
-                    "readdir: unexpected response id {resp_id}"
-                )));
-            }
-            if ready.insert(resp_id, (t, data)).is_some() {
-                let unread = pending_order.len().saturating_sub(ready.len() + 1);
-                Self::drain_packets(&mut *rr, unread);
-                drop(rr);
-                let _ = self.close_handle(&handle);
-                return Err(SftpError::Protocol(format!(
-                    "readdir: duplicate response id {resp_id}"
-                )));
-            }
-        }
-
-        drop(rr);
-        self.close_handle(&handle)?;
-        Ok(entries)
+        let _ = self.close_handle(&handle);
+        result
     }
 
     pub fn open(&self, path: &str, flags: u32, mode: u32) -> SftpResult<Vec<u8>> {
@@ -696,29 +617,121 @@ impl SftpSession {
     }
 
     pub fn read(&self, handle: &[u8], offset: u64, len: u32) -> SftpResult<Vec<u8>> {
+        struct PendingRead {
+            id: u32,
+            requested_len: u32,
+        }
+
         let total = len as u64;
         if total <= MAX_READ_SIZE as u64 {
             return self.read_single(handle, offset, len);
         }
 
-        // Some SFTP servers can return short DATA packets without EOF. When we
-        // treat each in-flight request as a full MAX_READ_SIZE chunk, that
-        // silently drops bytes and corrupts large files. Read large ranges in
-        // verified sequential chunks so we advance by bytes actually received.
         let mut result = Vec::with_capacity(total as usize);
-        let mut cur_offset = offset;
-        while result.len() < total as usize {
-            let remaining = total - result.len() as u64;
-            let chunk = self.read_single(
-                handle,
-                cur_offset,
-                remaining.min(MAX_READ_SIZE as u64) as u32,
-            )?;
-            if chunk.is_empty() {
+        let mut next_offset = offset;
+        let mut remaining = total;
+        let mut chunk_size = MAX_READ_SIZE;
+
+        while remaining > 0 {
+            let mut pending = Vec::new();
+            {
+                let mut w = self.writer.lock().map_err(|_| SftpError::Disconnected)?;
+                let mut request_offset = next_offset;
+                let mut request_remaining = remaining;
+                while pending.len() < READ_PIPELINE && request_remaining > 0 {
+                    let requested_len = request_remaining.min(chunk_size as u64) as u32;
+                    let id = self.next_id();
+                    let mut buf = Buf::new();
+                    buf.put_bytes(handle);
+                    buf.put_u64(request_offset);
+                    buf.put_u32(requested_len);
+                    Self::write_packet(&mut *w, SSH_FXP_READ, id, &buf.0)?;
+                    pending.push(PendingRead { id, requested_len });
+                    request_offset += requested_len as u64;
+                    request_remaining -= requested_len as u64;
+                }
+                w.flush().map_err(|_| SftpError::Disconnected)?;
+            }
+
+            let mut index_by_id = HashMap::with_capacity(pending.len());
+            for request in &pending {
+                index_by_id.insert(request.id, request.requested_len);
+            }
+
+            let mut responses = HashMap::with_capacity(pending.len());
+            {
+                let mut r = self.reader.lock().map_err(|_| SftpError::Disconnected)?;
+                for received in 0..pending.len() {
+                    let (t, data) = Self::read_packet(&mut *r)?;
+                    let unread = pending.len() - received - 1;
+                    let resp_id = match Self::response_id(&data) {
+                        Ok(id) => id,
+                        Err(err) => {
+                            Self::drain_packets(&mut *r, unread);
+                            return Err(err);
+                        }
+                    };
+                    if !index_by_id.contains_key(&resp_id) {
+                        Self::drain_packets(&mut *r, unread);
+                        return Err(SftpError::Protocol(format!(
+                            "pipelined read: unexpected response id {resp_id}"
+                        )));
+                    }
+                    if responses.insert(resp_id, (t, data)).is_some() {
+                        Self::drain_packets(&mut *r, unread);
+                        return Err(SftpError::Protocol(format!(
+                            "pipelined read: duplicate response id {resp_id}"
+                        )));
+                    }
+                }
+            }
+
+            let mut restart = false;
+            for request in &pending {
+                let Some((t, data)) = responses.remove(&request.id) else {
+                    return Err(SftpError::Protocol(
+                        "pipelined read: missing response".into(),
+                    ));
+                };
+
+                if t == SSH_FXP_STATUS {
+                    let mut sr = Reader::new(&data[4..]);
+                    let code = sr.get_u32()?;
+                    if code == SSH_FX_EOF {
+                        return Ok(result);
+                    }
+                    let msg = sr.get_string().unwrap_or_default();
+                    return Err(SftpError::Status(code, msg));
+                }
+                if t != SSH_FXP_DATA {
+                    return Err(SftpError::Disconnected);
+                }
+
+                let chunk = Reader::new(&data[4..]).get_bytes()?;
+                if chunk.is_empty() {
+                    return Ok(result);
+                }
+
+                next_offset += chunk.len() as u64;
+                remaining -= chunk.len() as u64;
+                result.extend_from_slice(&chunk);
+
+                if chunk.len() < request.requested_len as usize {
+                    // Later in-flight requests were scheduled assuming a full
+                    // chunk at this offset, so discard those responses and retry
+                    // from the first unread byte with a server-proven chunk size.
+                    chunk_size = chunk_size.min(chunk.len() as u32);
+                    restart = true;
+                    break;
+                }
+                if remaining == 0 {
+                    return Ok(result);
+                }
+            }
+
+            if !restart {
                 break;
             }
-            cur_offset += chunk.len() as u64;
-            result.extend_from_slice(&chunk);
         }
 
         Ok(result)
@@ -1030,6 +1043,14 @@ mod tests {
         (SSH_FXP_DATA, id, payload.0)
     }
 
+    fn status_packet(id: u32, code: u32) -> (u8, u32, Vec<u8>) {
+        let mut payload = Buf::new();
+        payload.put_u32(code);
+        payload.put_str("");
+        payload.put_str("");
+        (SSH_FXP_STATUS, id, payload.0)
+    }
+
     #[test]
     fn buf_put_u32() {
         let mut buf = Buf::new();
@@ -1169,25 +1190,45 @@ mod tests {
     }
 
     #[test]
-    fn large_read_advances_by_actual_bytes_returned() {
-        let session = session_with_packets(&[data_packet(2, b"second"), data_packet(1, b"first")]);
+    fn large_read_reorders_out_of_order_responses() {
+        let first = vec![b'a'; MAX_READ_SIZE as usize];
+        let second = b"second".to_vec();
+        let mut expected = first.clone();
+        expected.extend_from_slice(&second);
+        let session = session_with_packets(&[data_packet(2, &second), data_packet(1, &first)]);
 
-        let err = session.read(b"handle", 0, MAX_READ_SIZE + 1).unwrap_err();
-        assert!(matches!(err, SftpError::Protocol(_)));
+        let data = session
+            .read(b"handle", 0, MAX_READ_SIZE + second.len() as u32)
+            .unwrap();
+        assert_eq!(data, expected);
     }
 
     #[test]
     fn large_read_handles_short_chunks_without_skipping_bytes() {
-        let eof = {
-            let mut payload = Buf::new();
-            payload.put_u32(SSH_FX_EOF);
-            payload.put_str("");
-            payload.put_str("");
-            (SSH_FXP_STATUS, 3, payload.0)
-        };
-        let session = session_with_packets(&[data_packet(1, b"abc"), data_packet(2, b"def"), eof]);
+        let chunk = 65536usize;
+        let tail = b"tail".to_vec();
+        let a = vec![b'a'; chunk];
+        let b = vec![b'b'; chunk];
+        let c = vec![b'c'; chunk];
+        let d = vec![b'd'; chunk];
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+        expected.extend_from_slice(&c);
+        expected.extend_from_slice(&d);
+        expected.extend_from_slice(&tail);
+        let session = session_with_packets(&[
+            data_packet(2, b"ignored"),
+            data_packet(1, &a),
+            data_packet(5, &d),
+            data_packet(3, &b),
+            data_packet(6, &tail),
+            data_packet(4, &c),
+            status_packet(7, SSH_FX_EOF),
+        ]);
 
-        let data = session.read(b"handle", 0, MAX_READ_SIZE + 6).unwrap();
-        assert_eq!(data, b"abcdef");
+        let data = session
+            .read(b"handle", 0, MAX_READ_SIZE + tail.len() as u32 + 1)
+            .unwrap();
+        assert_eq!(data, expected);
     }
 }
